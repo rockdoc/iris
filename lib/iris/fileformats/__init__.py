@@ -23,6 +23,7 @@ import iris.io.format_picker as fp
 from iris.io.format_picker import FormatSpecification as FormatSpec
 import ff
 import grib
+import ncml
 import netcdf
 import nimrod
 import pp
@@ -126,3 +127,11 @@ FORMAT_AGENT.add_spec(FormatSpec('NIMROD',
                                  0x00000200,
                                  nimrod.load_cubes,
                                  priority=5))
+
+#
+# NetCDF Markup Language (NcML) files
+#
+FORMAT_AGENT.add_spec(FormatSpec('NetCDF Markup Language (NcML)',
+                                 fp.FILE_EXTENSION,
+                                 "ncml",
+                                 ncml.load_cubes))

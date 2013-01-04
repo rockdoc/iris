@@ -48,6 +48,11 @@ class CoordinateNotRegularError(ValueError):
     pass
 
 
+class DataLoadError(IrisError):
+    """Raised when an error is encountered trying to load a data source."""
+    pass
+
+
 class DuplicateDataError(IrisError):
     """Raised when merging two or more cubes that have identical metadata."""
     pass
