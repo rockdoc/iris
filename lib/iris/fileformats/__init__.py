@@ -133,5 +133,5 @@ FORMAT_AGENT.add_spec(FormatSpec('NIMROD',
 #
 FORMAT_AGENT.add_spec(FormatSpec('NetCDF Markup Language (NcML)',
                                  fp.FILE_EXTENSION,
-                                 "ncml",
+                                 ".ncml",
                                  ncml.load_cubes))
