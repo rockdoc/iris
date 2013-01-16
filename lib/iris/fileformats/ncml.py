@@ -1,5 +1,5 @@
 """
-WARNING: THIS CODE IS A WORK IN PROGRESS. IT DOESN'T WORK YET AND IS LIABLE TO CHANGE.
+WARNING: THIS CODE IS A WORK IN PROGRESS. IT DOESN'T WORK FULLY YET AND IS LIABLE TO CHANGE.
 
 Iris i/o module for reading NcML files. Current functionality is limited to the following:
 
@@ -8,11 +8,11 @@ Iris i/o module for reading NcML files. Current functionality is limited to the 
 * union-type aggregation based on <scan> elements
 * rename or remove variables (= cubes)
 * add, override, rename or remove attributes (global or per-variable)
-* handle the olderThan attribute on a scan element
+* create new 1D coordinate variables as DimCoord objects
 
 Functionality that is expressly excluded:
 
-* modification or removal of dimensions (this would interfere with Iris' handling of dimensions)
+* modification/removal of dimensions (this would interfere with Iris' handling of dimensions)
 * NcML group elements
 * forecastModelRun* elements
 * the Structure data type
@@ -20,17 +20,15 @@ Functionality that is expressly excluded:
 
 TO DO:
 
-* add a new dimension (as a DimCoord?)
-* add a new data variable?
 * joinExisting aggregation
 * joinNew aggregation
 * handle dateFormatMark for joinNew aggregation
-
+* add sphinx markup throughout
 """
 import sys, os, re, fnmatch, logging
 from datetime import datetime
-from collections import OrderedDict
 import iris
+import numpy as np
 import netCDF4 as nc4
 from xml.dom.minidom import parse
 
@@ -38,20 +36,47 @@ from xml.dom.minidom import parse
 DEFAULT_LOG_LEVEL  = logging.WARNING
 DEFAULT_LOG_FORMAT = "[%(name)s.%(funcName)s] %(levelname)s: %(message)s"
 
-# Define lists of permissible attributes for various NcML tags
+# Define lists of permissible attributes for various NcML 2.2 tags
 att_namelists = {
-    'variable': ('name', 'type', 'shape', 'orgName'),
+    'aggregation': ('type', 'dimName', 'recheckEvery'),
     'attribute': ('name', 'type', 'separator', 'value', 'orgName'),
+    'dimension': ('name', 'length', 'isUnlimited', 'isVariableLength', 'isShared', 'orgName'),
+    'netcdf': ('location', 'id', 'title', 'enhance', 'addRecords', 'ncoords', 'coordValue'),
     'scan': ('location', 'suffix', 'regExp', 'subdirs', 'olderThan', 'dateFormatMark', 'enhance'),
+    'values': ('start', 'increment', 'npts', 'separator'),
+    'variable': ('name', 'type', 'shape', 'orgName'),
+    'variableAgg': ('name',),
 }
 
 class NcmlSyntaxError(iris.exceptions.IrisError) :
+    """Exception class for NcML syntax errors."""
     pass
 
+class NcmlElement(object) :
+    """
+    A lightweight class for creating an object representation of an NcML element with equivalent
+    attributes. Avoids the need to create discrete classes for each NcML element type, which would
+    be a viable alternative approach."""
+    def __init__(self, node) :
+        self.node = node
+        for att_name in att_namelists.get(node.tagName,[]) :
+            att_value = node.getAttribute(att_name)
+            if att_value == '' : att_value = None
+            setattr(self, att_name, att_value)
+
+    @property
+    def elem_type(self) :
+        """Return the element type name."""
+        return self.node.tagName
+
+# Might want to rename this to Ncml2Dataset since it's tied to v2.2 of the NcML schema.
 class NcmlDataset(object) :
     """
-    Class for representing an aggregate dataset defined in an NcML file. Full details of the
-    NcML specification can be found at http://www.unidata.ucar.edu/software/netcdf/ncml/ 
+    Class for representing an aggregate dataset defined in an NcML v2.2 document. Full details of
+    the NcML specification can be found at http://www.unidata.ucar.edu/software/netcdf/ncml/
+    
+    NcML documents are parsed using a DOM XML parser as (i) this is easier to work with compared
+    with SAX parsers, and (ii) most NcML documents are likely to be small enough to fit into RAM.  
     """
 
     def __init__(self, file_like, **kwargs) :
@@ -63,9 +88,10 @@ class NcmlDataset(object) :
             defined by the standard logging module.
         """
         self.filename = None
-        self.attributes = dict()
+        self.dimensions = list()
+        self.dim_coords = list()
         self.part_filenames = list()
-        self.part_cubelists = list()
+        self.part_cubelists = list()   # FIXME: redundant?
         self.cubelist = iris.cube.CubeList()
         self.removelist = list()
         self.explicit = False
@@ -94,12 +120,14 @@ class NcmlDataset(object) :
                 self.logger.error("Error trying to parse NcML document.")
                 raise exc
             self._handle_doc(ncml_doc)
-            self.logger.info("Finished parsing. Loaded %d cubes from %d files" % (self.ncubes, self.nparts))
+            self.logger.info("Finished parsing. Loaded %d cube%s from %d files" % \
+                (self.ncubes, 's'[self.ncubes==1:], self.nparts))
         finally :
             if close_after_parse : ncml_file.close()
 
     def __del__(self) :
         """Perform any clean-up operations, e.g. closing open file handles."""
+        # TODO
         pass
 
     @property
@@ -131,28 +159,46 @@ class NcmlDataset(object) :
         self.logger.info("Document element name: "+doc.documentElement.tagName)
 
         # process <readMetadata> or <explicit> node, if present
-        explicit = doc.getElementsByTagName("explicit")
+        explicit = doc.getElementsByTagName('explicit')
         if explicit : self.explicit == True
 
         # create a list of items to remove during or after cube loading
-        remove_nodelist= doc.getElementsByTagName("remove")
+        remove_nodelist= doc.getElementsByTagName('remove')
         if len(remove_nodelist) : self._make_remove_list(remove_nodelist)
         
+        # process any <dimension> nodes
+        dim_nodelist = doc.getElementsByTagName('dimension')
+        if len(dim_nodelist) : self._handle_dimensions(dim_nodelist)
+
         # process an <aggregation> node, if present
-        agg_nodelist= doc.getElementsByTagName("aggregation")
+        agg_nodelist= doc.getElementsByTagName('aggregation')
         if len(agg_nodelist) : self._handle_aggregation(agg_nodelist[0])
 
         # process any global <attribute> nodes
-        att_nodelist = [n for n in doc.getElementsByTagName("attribute") if n.parentNode.tagName == 'netcdf']
+        att_nodelist = [n for n in doc.getElementsByTagName('attribute') if n.parentNode.tagName == 'netcdf']
         if len(att_nodelist) : self._handle_global_attributes(att_nodelist)
 
         # process any <variable> nodes
-        var_nodelist = doc.getElementsByTagName("variable")
+        var_nodelist = doc.getElementsByTagName('variable')
         if len(var_nodelist) : self._handle_variables(var_nodelist)
 
         # process any items in the remove list
         self._process_remove_list()
         
+    def _handle_dimensions(self, dim_nodelist) :
+        """Process all dimension nodes"""
+        self.logger.info("Processing dimension elements...")
+        for dim_node in dim_nodelist :
+            self._handle_dimension(dim_node)
+
+    def _handle_dimension(self, dim_node) :
+        """Process a single dimension node"""
+        dim = NcmlElement(dim_node)
+        if not dim.name :
+            raise NcmlSyntaxError("<dimension> elements must include a 'name' attribute.")
+        self.dimensions.append(dim)
+        self.logger.info("Added dimension %s" % dim.name)
+
     def _handle_global_attributes(self, att_nodelist) :
         """Process all attribute nodes"""
         self.logger.info("Processing global attributes...")
@@ -164,30 +210,28 @@ class NcmlDataset(object) :
     # class in module iris._cube_coord_common.py. We'll need to skip these.
     
     def _handle_attribute(self, att_node, var_name=None) :
-        """Process single attribute node"""
-        att_dict = self._get_node_att_dict(att_node, att_namelists['attribute'])
-        if not att_dict.get("name") :
+        """Process a single attribute node"""
+        att = NcmlElement(att_node)
+        if not att.name :
             raise NcmlSyntaxError("<attribute> elements must include a 'name' attribute.")
 
-        att_name = att_dict.get("name")
-        att_type = att_dict.get("type") or 'String'
-        att_sep  = att_dict.get("separator") or ','
-        att_val  = att_dict.get("value") or _get_node_text(att_node)
+        if not att.type : att.type = 'String'
+        if not att.value : att.value = _get_node_text(att_node)
 
         if var_name :
             # local - override current attribute only for the cube with the specified var name
             cubelist = [c for c in self.cubelist if c.var_name == var_name]
-            self.logger.info("Setting attribute %s for variable %s" % (att_name, var_name))
+            self.logger.info("Set attribute %s on variable %s" % (att.name, var_name))
         else :
             # global - override current attribute for all cubes
             cubelist = self.cubelist
-            self.logger.info("Setting attribute %s for all variables" % att_name)
+            self.logger.info("Set attribute %s on all variables" % att.name)
 
         # rename and/or update the attribute in one or all cubes
         for cube in cubelist :
-            if att_dict.get('orgName') :
-                old_val = cube.attributes.pop(att_dict['orgName'], None)
-            cube.attributes[att_name] = _cast_data_value(att_val, att_type, sep=att_sep)
+            if att.orgName :
+                old_val = cube.attributes.pop(att.orgName, None)
+            cube.attributes[att.name] = _cast_data_value(att.value, att.type, sep=att.separator)
 
     def _handle_variables(self, var_nodelist) :
         """Process all variable nodes"""
@@ -197,101 +241,180 @@ class NcmlDataset(object) :
 
     def _handle_variable(self, var_node) :
         """Process a single variable node"""
-        att_dict = self._get_node_att_dict(var_node, att_namelists['variable'])
-        if not att_dict.get("name") :
+        var = NcmlElement(var_node)
+        if not var.name :
             raise NcmlSyntaxError("<variable> elements must include a 'name' attribute.")
-        if not att_dict.get("type") :
+        if not var.type :
             raise NcmlSyntaxError("<variable> elements must include a 'type' attribute.")
+        self.logger.info("Variable element: name: '%s', type: '%s'" % (var.name, var.type))
 
-        var_name = att_dict.get("name")
-        var_type = att_dict.get("type")
-        var_shape  = att_dict.get("shape")
-        self.logger.info("Variable node: name: '%s', type: '%s'" % (var_name, var_type))
+        # check to see if the variable contains a nested <values> element (i.e. data)
+        val_nodes = var_node.getElementsByTagName('values')
+        has_values = len(val_nodes) == 1
+        
+        if has_values :
+            dim_names = [dim.name for dim in self.dimensions]
+            # If the variable's name and shape match a single dimension name, then assume that the
+            # variable element defines a coordinate variable which we can reify as an iris DimCoord
+            # object.
+            if var.name == var.shape and var.name in dim_names :
+                self._add_coord_variable(var)
+                self.logger.info("Added coordinate variable %s" % var.name)
 
-        # if necessary, first rename the variable from orgName to name
-        if att_dict.get('orgName') :
-            cube = self._get_cube_by_var_name(att_dict['orgName'])
-            if cube :
-                cube.var_name = var_name
-                self.logger.info("Renamed variable %s to %s" % (att_dict['orgName'], var_name))
-
-        # update any variable-scope attributes
-        att_nodelist = var_node.getElementsByTagName("attribute")
-        for att_node in att_nodelist :
-            self._handle_attribute(att_node, var_name)
+            # If variable name is not a dimension name, but shape name/s is/are, then assume that
+            # the variable element defines a data variable, possibly a scalar one, which we can
+            # reify as an iris Cube object.
+            elif var.name != var.shape : # and set(var.shape.split()) <= set(dim_names) :
+                self._add_data_variable(var)
+                if var.shape :
+                    self.logger.info("Added data variable %s as new cube" % var.name)
+                else :
+                    self.logger.info("Added scalar data variable %s as new cube" % var.name)
+            
+        else :
+            # if necessary, rename the variable from orgName to var.name
+            if var.orgName :
+                cube = self._get_cube_by_var_name(var.orgName)
+                if cube :
+                    cube.var_name = var.name
+                    self.logger.info("Renamed variable %s to %s" % (var.orgName, var.name))
+    
+            # update any variable-scope attributes
+            att_nodelist = var_node.getElementsByTagName('attribute')
+            for att_node in att_nodelist :
+                self._handle_attribute(att_node, var.name)
         
     def _handle_aggregation(self, agg_node) :
         """Process a single aggregation node"""
-        agg_type = agg_node.getAttribute("type")
-        if agg_type == "union" :
-            self._handle_union(agg_node)
-        elif agg_type == "joinNew" :
-            self._handle_joinnew(agg_node)
-        elif agg_type == "joinExisting" :
-            self._handle_joinexisting(agg_node)
+        agg = NcmlElement(agg_node)
+        if agg.type == 'union' :
+            self._handle_union(agg)
+        elif agg.type == 'joinNew' :
+            self._handle_joinnew(agg)
+        elif agg.type == 'joinExisting' :
+            self._handle_joinexisting(agg)
+        else :
+            errmsg = "Invalid type value '%s' specified in <aggregation> element." % agg.type
+            raise NcmlSyntaxError(errmsg)
 
-    def _handle_union(self, agg_node) :
-        """Process a union aggregation node"""
+    def _handle_union(self, agg_elem) :
+        """
+        Process a union aggregation node. As per the NcML schema specification, dimensions and
+        coordinate variables must match exactly across all of the nominated files. The current
+        implementation does not check that this holds true.
+        """
         self.logger.info("Processing union aggregation node...")
-        nc_nodes = agg_node.getElementsByTagName("netcdf")
-        scan_nodes = agg_node.getElementsByTagName("scan")
+        nc_nodes = agg_elem.node.getElementsByTagName('netcdf')
+        scan_nodes = agg_elem.node.getElementsByTagName('scan')
 
         # process <netcdf> nodes
         if len(nc_nodes) :
             for node in nc_nodes :
-                self._handle_union_netcdf_node(node)
+                self._handle_agg_netcdf_node(node)
 
         # process <scan> nodes
         elif len(scan_nodes) :
             for node in scan_nodes :
-                self._handle_union_scan_node(node)
+                self._handle_agg_scan_node(node)
 
-    def _handle_union_netcdf_node(self, node) :
-        """Process a union aggregation netcdf node"""
-        ncpath = node.getAttribute("location")
+    def _handle_joinexisting(self, agg_elem) :
+        """
+        Process a joinExisting aggregation node. From the NcML spec:
+            A JoinExisting dataset is constructed by transferring objects (dimensions, attributes,
+            groups, and variables) from the nested datasets in the order the nested datasets are
+            listed. All variables that use the aggregation dimension as their outer dimension are
+            logically concatenated, in the order of the nested datasets. Variables that don't use
+            the aggregation dimension are treated as in a Union dataset, i.e. skipped if one with
+            that name already exists.
+        """
+        self.logger.info("Processing joinExisting aggregation node...")
+        if not agg_elem.dimName :
+            errmsg = "<aggregation> elements of type 'joinExisting' must include a 'dimName' attribute."
+            raise NcmlSyntaxError(errmsg)
+
+        nc_nodes = agg_elem.node.getElementsByTagName('netcdf')
+        scan_nodes = agg_elem.node.getElementsByTagName('scan')
+
+        # process <netcdf> nodes
+        if len(nc_nodes) :
+            for node in nc_nodes :
+                self._handle_agg_netcdf_node(node, agg_type="joinExisting")
+
+        # process <scan> nodes
+        elif len(scan_nodes) :
+            for node in scan_nodes :
+                self._handle_agg_scan_node(node, agg_type="joinExisting")
+
+        # check to see if a coordinate object exists with name dimName
+        dim_coord = None
+        for coord in _get_coord_list(self.cubelist) :
+            if coord.name() == agg_elem.dimName :
+                dim_coord = coord
+                break
+        if not dim_coord :
+            errmsg = "Unable to find coordinate variable corresponding to dimension name %s." % agg_elem.dimName
+            raise iris.exceptions.DataLoadError(errmsg)
+
+        # remove any attributes which might impede the merging of cubes
+        att_blacklist = ['history']
+        for cube in self.cubelist :
+            for att in att_blacklist :
+                cube.attributes.pop(att, None)
+        
+        # apply a merge operation to the cubelist
+        before = len(self.cubelist)
+        tmp_cubes = self.cubelist.merge()
+        after = len(tmp_cubes)
+        if before != after : self.cubelist = tmp_cubes
+        self.logger.info("Concatenated %d original cubes into %d merged cube%s using %s dimension" % \
+            (before, after, 's'[after==1:], agg_elem.dimName))
+
+    def _handle_joinnew(self, agg_elem) :
+        """Process a joinNew aggregation node"""
+        raise iris.exceptions.NotYetImplementedError()
+
+    def _handle_agg_netcdf_node(self, node, agg_type="union") :
+        """Process an aggregation netcdf node"""
+        netcdf = NcmlElement(node)
+        if not netcdf.location :
+            raise NcmlSyntaxError("<netcdf> elements must include a 'location' attribute.")
+        ncpath = netcdf.location
         if not ncpath.startswith('/') : ncpath = os.path.join(self.basedir, ncpath)
 
+        # load cubes from the specified netcdf file
         self.logger.info("Scanning netCDF file '%s'..." % ncpath)
         cubelist = iris.fileformats.netcdf.load_cubes(ncpath, callback=_nc_load_callback)
 
         # store the filename and cubelist associated with this <netcdf> node
         self.part_filenames.append(ncpath)
-        self.part_cubelists.append(cubelist)
-        self._merge_cubelist(cubelist)
+        #self.part_cubelists.append(cubelist)
+        self._extend_cubelist(cubelist, unique_names=(agg_type=="union"))
 
-    def _handle_union_scan_node(self, node) :
-        """Process a union aggregation scan node"""
-        att_dict = self._get_node_att_dict(node, att_namelists['scan'])
-        if not att_dict.get('location') :
-            raise NcmlSyntaxError("The <scan> element must include a 'location' attribute.")
+    def _handle_agg_scan_node(self, node, agg_type="union") :
+        """Process an aggregation scan node"""
+        scan = NcmlElement(node)
+        if not scan.location :
+            raise NcmlSyntaxError("<scan> elements must include a 'location' attribute.")
 
-        topdir = att_dict.get('location')
+        topdir = scan.location
         if not topdir.startswith('/') : topdir = os.path.join(self.basedir, topdir)
-        subdirs = att_dict.get('subdirs', 'true') in ('true', 'True', '1') 
-        suffix = att_dict.get('suffix')
-        regex = att_dict.get('regExp')
-        min_age = att_dict.get('olderThan')
+        if not scan.subdirs : scan.subdirs = 'true'
+        subdirs = scan.subdirs in ('true', 'True', '1') 
+        regex = scan.regExp
+        min_age = scan.olderThan
+        if min_age : min_age = _conv_time_string_to_interval(min_age)
 
         # if no regex was defined, use suffix if that was defined
-        if not regex and suffix : regex = '.*' + suffix + "$"
+        if not regex and scan.suffix : regex = '.*' + scan.suffix + '$'
 
         # walk directory tree from topdir searching for files matching regex
+        # load cubes from each matching netcdf file
         for ncpath in _walk_dir_tree(topdir, recurse=subdirs, regex=regex, min_age=min_age) :
             self.logger.info("Scanning netCDF file '%s'..." % ncpath)
             self.part_filenames.append(ncpath)
             cubelist = iris.fileformats.netcdf.load_cubes(ncpath, callback=_nc_load_callback)
-            self.part_cubelists.append(cubelist)
-            self._merge_cubelist(cubelist)
-
-    def _handle_joinnew(self, agg_node) :
-        """Process a joinNew aggregation node"""
-        # raise iris.exceptions.NotYetImplementedError()
-        pass
-
-    def _handle_joinexisting(self, agg_node) :
-        """Process a joinExisting aggregation node"""
-        # raise iris.exceptions.NotYetImplementedError()
-        pass
+            #self.part_cubelists.append(cubelist)
+            self._extend_cubelist(cubelist, unique_names=(agg_type=="union"))
 
     # NOT CURRENTLY USED
     def _handle_remove_nodes(self, remove_nodelist) :
@@ -309,15 +432,15 @@ class NcmlDataset(object) :
         Process a single remove node. At present only variable (=cube) and attribute objects can
         be removed.
         """
-        obj_name = remove_node.getAttribute("name")
-        obj_type = remove_node.getAttribute("type")
+        obj_name = remove_node.getAttribute('name')
+        obj_type = remove_node.getAttribute('type')
         if not (obj_name and obj_type) :
             self.logger.warn("<remove> elements must include a 'name' and 'type' attribute.")
             return
         parent_tagname = remove_node.parentNode.tagName
         
         # for variables remove the corresponding cube, if present
-        if obj_type == "variable" :
+        if obj_type == 'variable' :
             cube = self._get_cube_by_var_name(obj_name)
             if cube:
                 self.cubelist.remove(cube)
@@ -326,13 +449,13 @@ class NcmlDataset(object) :
                 self.logger.warn("No cube found corresponding to variable named %s" % obj_name)
 
         # remove an attribute, either from all cubes or from a named cube 
-        elif obj_type == "attribute" :
-            if parent_tagname == "netcdf" :
+        elif obj_type == 'attribute' :
+            if parent_tagname == 'netcdf' :
                 for cube in self.cubelist :
                     cube.attributes.pop(obj_name, None)
                 self.logger.info("Removed attribute %s from all variables" % obj_name)
-            elif parent_tagname == "variable" :
-                var_name = remove_node.parentNode.getAttribute("name")
+            elif parent_tagname == 'variable' :
+                var_name = remove_node.parentNode.getAttribute('name')
                 cube = self._get_cube_by_var_name(var_name)
                 if cube:
                     cube.attributes.pop(obj_name, None)
@@ -350,39 +473,40 @@ class NcmlDataset(object) :
             return
 
         for node in remove_nodelist :
-            obj_name = node.getAttribute("name")
-            obj_type = node.getAttribute("type")
+            obj_name = node.getAttribute('name')
+            obj_type = node.getAttribute('type')
             if not (obj_name and obj_type) :
                 self.logger.warn("<remove> elements must include a 'name' and 'type' attribute.")
-                return
-            if obj_type not in ("attribute", "variable") :
+                continue
+            if obj_type not in ('attribute', 'variable') :
                 self.logger.warn("Can only remove elements of type attribute or variable")
-                return
+                continue
             parent_type = node.parentNode.tagName
-            if parent_type == "netcdf" :
-                parent_name = "netcdf"
+            if parent_type == 'netcdf' :
+                parent_name = 'netcdf'
             else :
-                parent_name = node.parentNode.getAttribute("name")
+                parent_name = node.parentNode.getAttribute('name')
+            # TODO: consider storing <remove> elements using NcmlElement class
             d = dict(name=obj_name, type=obj_type, parent_name=parent_name, parent_type=parent_type)
             self.removelist.append(d)
 
     def _process_remove_list(self) :
         """Process items in the remove list."""
         for item in self.removelist :
-            if item['type'] == "variable" :   # variables should not have made it into the cubelist
+            if item['type'] == 'variable' :   # variables should not have made it into the cubelist
                 continue
-            elif item['type'] == "attribute" :
+            elif item['type'] == 'attribute' :
                 att_name = item['name']
-                if item['parent_type'] == "netcdf" :   # global attribute
+                if item['parent_type'] == 'netcdf' :   # global attribute
                     for cube in self.cubelist :
                         cube.attributes.pop(att_name, None)
                     self.logger.info("Removed attribute %s from all cubes" % att_name)
-                elif item['parent_type'] == "variable" :   # variable-scope attribute
+                elif item['parent_type'] == 'variable' :   # variable-scope attribute
                     var_name = item['parent_name']
                     cube = self._get_cube_by_var_name(var_name)
                     if cube:
                         cube.attributes.pop(att_name, None)
-                        self.logger.info("Removed attribute %s from variable %s" % (att_name, var_name))
+                        self.logger.info("Removed attribute %s from cube %s" % (att_name, var_name))
                     else :
                         self.logger.warn("No cube found corresponding to variable %s" % var_name)
 
@@ -390,33 +514,131 @@ class NcmlDataset(object) :
         """Check to see if an element or cube is flagged for removal via a <remove> element."""
         if isinstance(node_or_cube, iris.cube.Cube) :
             obj_name = node_or_cube.var_name
-            obj_type = "variable"
-            parent_type = "netcdf"
-            parent_name = "netcdf"
+            obj_type = 'variable'
+            parent_type = 'netcdf'
+            parent_name = 'netcdf'
         else :
-            obj_name = node_or_cube.getAttribute("name")
-            obj_type = node_or_cube.getAttribute("type")
+            obj_name = node_or_cube.getAttribute('name')
+            obj_type = node_or_cube.getAttribute('type')
             if not (obj_name and obj_type) : return False
             parent_type = node_or_cube.parentNode.tagName
-            if parent_type == "netcdf" :
-                parent_name = "netcdf"
+            if parent_type == 'netcdf' :
+                parent_name = 'netcdf'
             else :
-                parent_name = node_or_cube.parentNode.getAttribute("name")
+                parent_name = node_or_cube.parentNode.getAttribute('name')
         d = dict(name=obj_name, type=obj_type, parent_name=parent_name, parent_type=parent_type)
         return d in self.removelist
 
-    def _merge_cubelist(self, cubelist) :
-        """Append distinct cubes from cubelist to the ncml dataset cubelist."""
+    def _add_coord_variable(self, var_elem) :
+        """Create a coordinate variable (an iris DimCoord object) from a <variable> element."""
+        nodes = var_elem.node.getElementsByTagName('values')
+        if not nodes :
+            raise NcmlSyntaxError("A <values> element is required to create a coordinate variable")
+
+        val_node = nodes[0]
+        values = NcmlElement(val_node)
+
+        # compute or retrieve coordinate values
+        if values.start :
+            try :
+                start = int(values.start)
+                inc = int(values.increment)
+            except :
+                start = float(values.start)
+                inc = float(values.increment)
+            points = []
+            for i in range(int(values.npts)) :
+                points.append(start + i*inc)
+        else :
+            text_values = _get_node_text(val_node)
+            points = _cast_data_value(text_values, var_elem.type, sep=values.separator)
+
+        # set any keyword arguments from nested <attribute> elements
+        kw = dict(standard_name=None, long_name=None, units='1')
+        att_nodelist = var_elem.node.getElementsByTagName('attribute')
+        for node in att_nodelist :
+            name = node.getAttribute('name')
+            if name in kw : kw[name] = node.getAttribute('value')
+        
+        # create and store the DimCoord object for subsequent use
+        dim_coord = iris.coords.DimCoord(np.array(points), **kw)
+        dim_coord.var_name = var_elem.name
+        self.dim_coords.append(dim_coord)
+
+    def _add_data_variable(self, var_elem) :
+        """Create a data variable (an iris Cube) from a <variable> element."""
+        nodes = var_elem.node.getElementsByTagName('values')
+        if not nodes :
+            raise NcmlSyntaxError("A <values> element is required to create a coordinate variable")
+
+        val_node = nodes[0]
+        values = NcmlElement(val_node)
+
+        # compute or retrieve coordinate values
+        if values.start :
+            try :
+                start = int(values.start)
+                inc = int(values.increment)
+            except :
+                start = float(values.start)
+                inc = float(values.increment)
+            points = []
+            for i in range(int(values.npts)) :
+                points.append(start + i*inc)
+        else :
+            text_values = _get_node_text(val_node)
+            points = _cast_data_value(text_values, var_elem.type, sep=values.separator)
+
+        # set any keyword arguments from nested <attribute> elements
+        kw = dict(standard_name=None, long_name=None, units='1', cell_methods=None)
+        att_nodelist = var_elem.node.getElementsByTagName('attribute')
+        for node in att_nodelist :
+            name = node.getAttribute('name')
+            if name in kw : kw[name] = node.getAttribute('value')
+
+        # for a dimensioned (non-scalar) variable
+        if var_elem.shape :
+            shape = []
+            coords = []
+            # create coordinate list for this variable
+            # FIXME: I reckon this may be a somewhat brittle approach
+            all_coords = self.dim_coords[:]
+            all_coords.extend(_get_coord_list(self.cubelist))
+            dimnum = 0
+            for i,dim_name in enumerate(var_elem.shape.split()) :
+                for dim_coord in all_coords :
+                    if dim_name == dim_coord.var_name or dim_name == dim_coord.standard_name :
+                        coords.append([dim_coord,dimnum])
+                        shape.append(len(dim_coord.points))
+                        dimnum += 1
+                        break
+
+        # for a scalar variable we just need to set the array shape
+        else :
+            shape = [1]
+            coords = []
+            
+        # create a cube object and add to self's cubelist
+        data = np.array(points)
+        data.shape = shape
+        cube = iris.cube.Cube(data, dim_coords_and_dims=coords, **kw)
+        cube.var_name = var_elem.name
+        self.cubelist.append(cube)
+        self.logger.debug("- cube min value: %s" % cube.data.min())
+        self.logger.debug("- cube max value: %s" % cube.data.max())
+
+    def _extend_cubelist(self, cubelist, unique_names=False) :
+        """Append distinct cubes from cubelist to the NcMLDataset's current cubelist."""
         for cube in cubelist :
-            # skip this variable if it's flagged for removal
+            # skip variable if it's flagged for removal
             if self._is_flagged_for_removal(cube) :
-                self.logger.info("Removed netCDF variable %s" % cube.var_name)
-                continue
-            # ignore this variable if it's already present
-            elif cube.name() in self.get_cube_names() :
-                continue
-            self.cubelist.append(cube)
-            self.logger.info("Added netCDF variable %s" % cube.var_name)
+                self.logger.info("Skipped netCDF variable %s (reason: target of <remove> element)" % cube.var_name)
+            # skip variable if it's already present
+            elif cube.name() in self.get_cube_names() and unique_names :
+                self.logger.info("Skipped netCDF variable %s (reason: loaded from earlier file)" % cube.var_name)
+            else :
+                self.cubelist.append(cube)
+                self.logger.info("Added netCDF variable %s" % cube.var_name)
 
     def _update_cube_attributes(self, attrs) :
         """Override any cubes attributes with those specified in the attrs dict argument."""
@@ -429,15 +651,6 @@ class NcmlDataset(object) :
         for cube in self.cubelist :
             if cube.var_name == var_name : return cube
         return None
-
-    def _get_node_att_dict(self, node, att_namelist) :
-        """Return a dictionary of the attributes named in att_namelist for the specified node."""
-        att_dict = dict()
-        for name in att_namelist :
-            value = node.getAttribute(name)
-            if value == '' : value = None
-            att_dict[name] = value
-        return att_dict
 
     def _init_logger(self) :
         """Initialise a logger object using default or user-supplied settings."""
@@ -481,37 +694,75 @@ def _nc_load_callback(cube, field, filename) :
     """Callback for adding netCDF variable name as cube attribute."""
     # for netcdf files, field is of type iris.fileformats.cf.CFDataVariable
     if hasattr(field, '_name') :
-        cube.var_name = field._name
+        cube.var_name = field._name   # how robust is this?
     else :
         cube.var_name = 'undefined'
 
+def _get_node_att_dict(node, att_namelist) :
+    """Return a dictionary of the attributes named in att_namelist for the specified node."""
+    att_dict = dict()
+    for name in att_namelist :
+        value = node.getAttribute(name)
+        if value == '' : value = None
+        att_dict[name] = value
+    return att_dict
+
+def _get_coord_list(cubelist) :
+    """
+    Return a list of coordinate objects (DimCoords, AuxCoords) associated with the specified
+    cubelist.
+    """
+    # FIXME: this function would probably be better recast as a generator
+    coord_list = []
+    for cube in cubelist :
+        for coord in cube.coords() :
+            if coord not in coord_list : coord_list.append(coord)
+    return coord_list
+
 def _get_node_text(node) :
     """Retrieve the character data from an XML node."""
-    rc = []
+    text = []
     for child in node.childNodes :
         if child.nodeType == child.TEXT_NODE :
-            rc.append(child.data)
-    return ''.join(rc)
+            text.append(child.data)
+    return ''.join(text)
+
+def _concat_dim_coords(coord_list) :
+    """Concatenate a set of DimCoord objects into a single DimCoord instance."""
+    points = coord_list[0].points
+    bounds = coord_list[0].bounds
+    for coord in coord_list[1:] :
+        points = np.append(points, coord.points)
+        if bounds : bounds = np.append(bounds, coord.bounds)
+    dcoord = coord_list[0].copy(points, bounds)
+    return dcoord
+
+def _conv_time_string_to_interval(timestr) :
+    """
+    Convert an NcML time period defined as a string to an interval in whole seconds. The main use
+    for this is to convert the value specified in the olderThan attribute to a useable interval.
+    The time string must be in the format "value timeunit", e.g. "5 min", "1 hour", and so on.
+    """
+    try :
+        ival,iunit = timestr.split()
+        iunit = iris.unit.Unit(iunit)
+        sunit = iris.unit.Unit('second')
+        interval = iunit.convert(float(ival), sunit)
+        #print "interval (secs):", interval
+        return long(interval)
+    except :
+        raise ValueError("Error trying to decode time period: %s" % timestr)
 
 def _is_older_than(filename, interval) :
     """
     Return true if the latest modification time of filename is older than the specified interval
-    before present. As per the NcML spec, interval must be a udunits2-compliant time value/unit pair
-    e.g. '5 min'."""
+    (in seconds) before present."""
     # get modification time of filename
     mtime = datetime.fromtimestamp(os.path.getmtime(filename))
     
-    # convert the specified time interval to seconds
-    ival,iunit = interval.split()
-    iunit = iris.unit.Unit(iunit)
-    sunit = iris.unit.Unit('second')
-    interval_sec = iunit.convert(float(ival), sunit)
-#    print "interval (secs):", interval_sec
-
-    # see if file modification time is older than interval_sec
+    # see if file modification time is older than interval
     age = datetime.now() - mtime
-#    print "age (secs):", age.total_seconds()
-    return (age.total_seconds() > interval_sec)
+    return (age.total_seconds() > interval)
     
 def _walk_dir_tree(topdir, recurse=True, regex=None, min_age=None, sort=False) :
     """
@@ -530,47 +781,33 @@ def _walk_dir_tree(topdir, recurse=True, regex=None, min_age=None, sort=False) :
             yield curr_file
         if not recurse : break
  
-def _cast_data_value(value, nctype, sep=",") :
+def _cast_data_value(value, nctype, sep=None) :
     """
-    Cast the specified text value to the NcML/NetCDF data type given by nctype.
+    Cast the specified text value to the NcML/NetCDF data type given by nctype. By default, in
+    NcML documents, valies in lists are separated by whitespace.
     NOTE: there is no support at present for the 'Structure' data type described in the NcML spec.
     """
-    # TODO: consider casting return values to numpy data types rather than the python data
-    #       types currently used below
-    if nctype == 'byte' :
-        if sep in value :
-            return [int(x) for x in value.split(sep)]
-        else :
-            return int(value)
-    elif nctype == 'short' :
-        if sep in value :
-            return [int(x) for x in value.split(sep)]
-        else :
-            return int(value)
-    elif nctype == 'int' :
-        if sep in value :
-            return [int(x) for x in value.split(sep)]
-        else :
-            return int(value)
-    elif nctype == 'long' :   # synonym for int in NcML/CDL grammar
-        if sep in value :
-            return [int(x) for x in value.split(sep)]
-        else :
-            return long(value)
-    elif nctype == 'float' :
-        if sep in value :
-            return [float(x) for x in value.split(sep)]
-        else :
-            return float(value)
-    elif nctype == 'double' :
-        if sep in value :
-            return [float(x) for x in value.split(sep)]
-        else :
-            return float(value)
-    elif nctype in ('char','string','String') :
+    if nctype in ('char', 'string', 'String') :
         return value
+    elif nctype == 'byte' :
+        vlist = [np.int8(x) for x in value.split(sep)]
+    elif nctype == 'short' :
+        vlist = [np.int16(x) for x in value.split(sep)]
+    elif nctype == 'int' :
+        vlist = [np.int32(x) for x in value.split(sep)]
+    elif nctype == 'long' :   # synonym for int in NcML/CDL grammar
+        vlist = [np.int32(x) for x in value.split(sep)]
+    elif nctype == 'float' :
+        vlist = [np.float32(x) for x in value.split(sep)]
+    elif nctype == 'double' :
+        vlist = [np.float64(x) for x in value.split(sep)]
     else :
         raise iris.exceptions.DataLoadError("Unsupported NcML attribute data type: %s" % nctype)
+
+    if len(vlist) == 1 :
+        return vlist[0]
+    else :
+        return vlist
 
 def test(ncml_filename) :
     """Rudimentary test function"""
@@ -578,7 +815,7 @@ def test(ncml_filename) :
     for i,cube in enumerate(cubes) :
         dmin = cube.data.min()
         dmax = cube.data.max()
-        print "Cube #%d, std name: %s, shape: %s, min: %f, max: %f" % (i, cube.name(), cube.shape, dmin, dmax)
+        print "Cube #%d: { std name: %s, shape: %s }" % (i, cube.name(), cube.shape)
 
 if __name__ == "__main__" :
     usage = "usage: python ncml.py <ncml_file>"
