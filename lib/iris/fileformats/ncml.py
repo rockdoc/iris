@@ -1,11 +1,11 @@
 """
 WARNING: THIS CODE IS A WORK IN PROGRESS. IT DOESN'T WORK FULLY YET AND IS LIABLE TO CHANGE.
 
-Iris i/o module for reading NcML files. Current functionality is limited to the following:
+Iris i/o module for loading NcML v2.2 files. Current functionality is limited to the following:
 
 * only handles aggregations of netcdf files
-* union-type aggregation based on <netcdf> elements
-* union-type aggregation based on <scan> elements
+* union-type aggregation based on <netcdf> or <scan> elements
+* joinExisting-type aggregation for simple 1D aggregation dimensions only
 * rename or remove variables (= cubes)
 * add, override, rename or remove attributes (global or per-variable)
 * create new 1D coordinate variables as DimCoord objects
@@ -22,7 +22,9 @@ TO DO:
 
 * joinExisting aggregation
 * joinNew aggregation
-* handle dateFormatMark for joinNew aggregation
+* handle dateFormatMark for join-type aggregations
+* handle coordValue attribute for join-type aggregations
+* support loading of non-netcdf data formats?
 * add sphinx markup throughout
 """
 import sys, os, re, fnmatch, logging
@@ -33,7 +35,7 @@ import netCDF4 as nc4
 from xml.dom.minidom import parse
 
 # default logging options
-DEFAULT_LOG_LEVEL  = logging.WARNING
+DEFAULT_LOG_LEVEL  = logging.WARN
 DEFAULT_LOG_FORMAT = "[%(name)s.%(funcName)s] %(levelname)s: %(message)s"
 
 # Define lists of permissible attributes for various NcML 2.2 tags
@@ -95,10 +97,7 @@ class NcmlDataset(object) :
         self.cubelist = iris.cube.CubeList()
         self.removelist = list()
         self.explicit = False
-
-        # Initialise logger object
-        self.log_level = kwargs.pop('log_level', DEFAULT_LOG_LEVEL)
-        self._init_logger()
+        self.logger = logger
 
         # Check to see whether caller supplied a filename or file-like object.
         close_after_parse = False
@@ -307,13 +306,13 @@ class NcmlDataset(object) :
         nc_nodes = agg_elem.node.getElementsByTagName('netcdf')
         scan_nodes = agg_elem.node.getElementsByTagName('scan')
 
-        # process <netcdf> nodes
+        # Process any <netcdf> nodes.
         if len(nc_nodes) :
             for node in nc_nodes :
                 self._handle_agg_netcdf_node(node)
 
-        # process <scan> nodes
-        elif len(scan_nodes) :
+        # Process any <scan> nodes.
+        if len(scan_nodes) :
             for node in scan_nodes :
                 self._handle_agg_scan_node(node)
 
@@ -335,39 +334,50 @@ class NcmlDataset(object) :
         nc_nodes = agg_elem.node.getElementsByTagName('netcdf')
         scan_nodes = agg_elem.node.getElementsByTagName('scan')
 
-        # process <netcdf> nodes
+        # Process any <netcdf> nodes.
         if len(nc_nodes) :
             for node in nc_nodes :
                 self._handle_agg_netcdf_node(node, agg_type="joinExisting")
 
-        # process <scan> nodes
-        elif len(scan_nodes) :
+        # Process any <scan> nodes.
+        if len(scan_nodes) :
             for node in scan_nodes :
                 self._handle_agg_scan_node(node, agg_type="joinExisting")
 
-        # check to see if a coordinate object exists with name dimName
-        dim_coord = None
-        for coord in _get_coord_list(self.cubelist) :
-            if coord.name() == agg_elem.dimName :
-                dim_coord = coord
-                break
-        if not dim_coord :
-            errmsg = "Unable to find coordinate variable corresponding to dimension name %s." % agg_elem.dimName
-            raise iris.exceptions.DataLoadError(errmsg)
+        # Get distinct variable names from the raw loaded cubelist.
+        distinct_var_names = set([c.name() for c in self.cubelist])
 
-        # remove any attributes which might impede the merging of cubes
-        att_blacklist = ['history']
-        for cube in self.cubelist :
-            for att in att_blacklist :
-                cube.attributes.pop(att, None)
-        
-        # apply a merge operation to the cubelist
+        # Create an empty cubelist to hold the joined cubes.
+        joined_cubes = iris.cube.CubeList()
         before = len(self.cubelist)
-        tmp_cubes = self.cubelist.merge()
-        after = len(tmp_cubes)
-        if before != after : self.cubelist = tmp_cubes
-        self.logger.info("Concatenated %d original cubes into %d merged cube%s using %s dimension" % \
-            (before, after, 's'[after==1:], agg_elem.dimName))
+        
+        # For each distinct variable, attempt to perform a join operation on those variables which
+        # are (i) associated with 2 or more cubes, and (ii) reference the aggregation dimension.
+        # All other variables are simply copied over as-is.
+        for var_name in distinct_var_names :
+            var_cubes = [c for c in self.cubelist if c.name() == var_name]
+            if len(var_cubes) > 1 and var_cubes[0].coords(name=agg_elem.dimName, dim_coords=True) :
+                try :
+                    tmp_cube = _concat_cubes(var_cubes, agg_elem.dimName)
+                    joined_cubes.append(tmp_cube)
+                    for cube in var_cubes : del cube
+                except Exception, exc :
+                    self.logger.error("Unable to join cubes associated with variable "+var_name)
+                    self.logger.error(str(exc))
+                    raise exc
+            else :
+                joined_cubes.extend(var_cubes)
+
+        # Advertise the results.
+        after = len(joined_cubes)
+        if before != after :
+            self.cubelist = joined_cubes
+            msg = "Reduced %d input cubes down to %d after join along %s dimension" \
+                % (before, after, agg_elem.dimName)
+            self.logger.info(msg)
+        else :
+            msg = "Unable to join any cubes along %s dimension" % agg_elem.dimName
+            self.logger.info(msg)
 
     def _handle_joinnew(self, agg_elem) :
         """Process a joinNew aggregation node"""
@@ -652,22 +662,15 @@ class NcmlDataset(object) :
             if cube.var_name == var_name : return cube
         return None
 
-    def _init_logger(self) :
-        """Initialise a logger object using default or user-supplied settings."""
-        console = logging.StreamHandler(stream=sys.stderr)
-        console.setLevel(self.log_level)
-        fmtr = logging.Formatter(DEFAULT_LOG_FORMAT)
-        console.setFormatter(fmtr)
-        #self.logger = logging.getLogger(self.__class__.__module__ + '.' + self.__class__.__name__)
-        self.logger = logging.getLogger(self.__class__.__name__)
-        self.logger.addHandler(console)
-        self.logger.setLevel(self.log_level)
-
 def load_cubes(filenames, callback=None, **kwargs) :
     """
     Generator function returning a sequence of cube objects associated with the netCDF files
     specified within an NcML file. The current implementation can only handle a single NcML file.
     """
+    # Update logger object if necessary
+    log_level = kwargs.pop('log_level')
+    if log_level : _update_logger(log_level)
+
     if isinstance(filenames, (list,tuple)) :
         if len(filenames) > 1 :
             errmsg = "Iris can only read a single NcML file; %d filenames were specified."%len(filenames)
@@ -690,6 +693,26 @@ def load_cubes(filenames, callback=None, **kwargs) :
     for cube in ncml_dataset.get_cubes() :
         yield cube
 
+def _init_logger(log_level=DEFAULT_LOG_LEVEL, log_format=DEFAULT_LOG_FORMAT) :
+    """Initialise a logger object using default or user-supplied settings."""
+    console = logging.StreamHandler(stream=sys.stderr)
+    console.setLevel(log_level)
+    fmtr = logging.Formatter(log_format)
+    console.setFormatter(fmtr)
+    logger = logging.getLogger('iris.fileformats.ncml')
+    logger.addHandler(console)
+    logger.setLevel(log_level)
+    return logger
+
+def _update_logger(level=None, format=None) :
+    """Update logging level and/or format properties."""
+    if level : logger.setLevel(level)
+    for handler in logger.handlers :
+        if level : handler.setLevel(level)
+        if format : handler.setFormatter(logging.Formatter(format))
+
+logger = _init_logger()
+
 def _nc_load_callback(cube, field, filename) :
     """Callback for adding netCDF variable name as cube attribute."""
     # for netcdf files, field is of type iris.fileformats.cf.CFDataVariable
@@ -707,6 +730,14 @@ def _get_node_att_dict(node, att_namelist) :
         att_dict[name] = value
     return att_dict
 
+def _get_node_text(node) :
+    """Retrieve the character data from an XML node."""
+    text = []
+    for child in node.childNodes :
+        if child.nodeType == child.TEXT_NODE :
+            text.append(child.data)
+    return ''.join(text)
+
 def _get_coord_list(cubelist) :
     """
     Return a list of coordinate objects (DimCoords, AuxCoords) associated with the specified
@@ -719,23 +750,81 @@ def _get_coord_list(cubelist) :
             if coord not in coord_list : coord_list.append(coord)
     return coord_list
 
-def _get_node_text(node) :
-    """Retrieve the character data from an XML node."""
-    text = []
-    for child in node.childNodes :
-        if child.nodeType == child.TEXT_NODE :
-            text.append(child.data)
-    return ''.join(text)
+def _concat_cubes(cubelist, dim_name) :
+    """
+    Concatenate the passed in cubelist along the specified dimension. The cube data must be concat-
+    enated in the same order as the corresponding dimension coordinates, be they increasing or
+    decreasing. The current implementation copies any cube attributes from the first input cube.
+    """
+    # Retrieve the list of DimCoord objects associated with the input cubes.
+    dim_coord_list = []
+    for cube in cubelist :
+        dim_coord_list.extend(cube.coords(name=dim_name, dim_coords=True))
 
-def _concat_dim_coords(coord_list) :
-    """Concatenate a set of DimCoord objects into a single DimCoord instance."""
-    points = coord_list[0].points
-    bounds = coord_list[0].bounds
-    for coord in coord_list[1:] :
-        points = np.append(points, coord.points)
-        if bounds : bounds = np.append(bounds, coord.bounds)
+    # Since cubes don't share coord objects, the lengths of the cube and coord lists should be
+    # the same.
+    if len(dim_coord_list) != len(cubelist) :
+        errmsg = "Number of coordinate objects (%d) does not match number of cubes (%d)" \
+            % (len(dim_coord_list), len(cubelist))
+        raise iris.exceptions.DataLoadError(errmsg)
+
+    # Sort the cube list and dim coord list in tandem. Do a reverse sort if the first DimCoord
+    # object is monotonic decreasing.
+    reverse = dim_coord_list[0].points[0] > dim_coord_list[0].points[-1]
+    sort_key = lambda i: i[0].points[0]
+    dim_coord_list, cubelist = zip(*sorted(zip(dim_coord_list, cubelist), key=sort_key,
+        reverse=reverse))
+
+    # Create a new DimCoord object from dim_coord_list, which has just been sorted.
+    agg_dim_coord = _concat_dim_coords(dim_coord_list, sort=False)
+    logger.debug("Shape of aggregated coordinate data: %s" % str(agg_dim_coord.points.shape))
+
+    # Concatenate all the data arrays from the input cubes.
+    # Is this the most efficient idiom? Preferable to np.concatenate I think.
+    data = cubelist[0].data
+    for c in cubelist[1:] :
+        data = np.append(data, c.data, axis=0)
+    logger.debug("Shape of aggregated data array: %s" % str(data.shape))
+
+    # Create a new cube from the aggregated data array and by copying metadata attributes from
+    # the first input cube. Associate the cube with the new aggregated DimCoord object. Because
+    # the data and coordinate array shapes have changed we can't use the cube.copy() method.
+    cube0 = cubelist[0]
+    newcube = iris.cube.Cube(data, standard_name=cube0.standard_name, long_name=cube0.long_name,
+        units=cube0.units, attributes=cube0.attributes.copy(), cell_methods=cube0.cell_methods)
+    # copy over all dimension coordinates
+    for coord in cube0.dim_coords :
+        dim = cube0.coord_dims(coord)[0]
+        if coord.name() == dim_name :
+            newcube.add_dim_coord(agg_dim_coord, dim)
+        else :
+            newcube.add_dim_coord(coord, dim)
+    # copy over all auxiliary coordinates
+    for coord in cube0.aux_coords :
+        dims = cube0.coord_dims(coord)
+        newcube.add_aux_coord(coord, dims)
+
+    return newcube
+
+def _concat_dim_coords(coord_list, sort=True, reverse=False) :
+    """
+    Concatenate a set of similar DimCoord objects into a single DimCoord object. Assumes that all
+    of the input coord objects are identical except for their points and bounds arrays. By default
+    the DimCoords are concatenated in ascending order of their first point. Set the reverse keyword
+    to True to concatenate in descending order. Set the sort keyword to False to disable sorting.
+    """
+    if sort : coord_list.sort(_coord_sorter, reverse=reverse)
+    points = np.concatenate([c.points for c in coord_list], axis=0)
+    if coord_list[0].has_bounds() :
+        bounds = np.concatenate([c.bounds for c in coord_list], axis=0)
+    else :
+        bounds = None
     dcoord = coord_list[0].copy(points, bounds)
     return dcoord
+
+def _coord_sorter(coord, other) :
+    """Sort two coord objects by comparing the value of their first point."""
+    return cmp(coord.points[0], other.points[0])
 
 def _conv_time_string_to_interval(timestr) :
     """
@@ -784,7 +873,7 @@ def _walk_dir_tree(topdir, recurse=True, regex=None, min_age=None, sort=False) :
 def _cast_data_value(value, nctype, sep=None) :
     """
     Cast the specified text value to the NcML/NetCDF data type given by nctype. By default, in
-    NcML documents, valies in lists are separated by whitespace.
+    NcML documents, values in lists are separated by whitespace.
     NOTE: there is no support at present for the 'Structure' data type described in the NcML spec.
     """
     if nctype in ('char', 'string', 'String') :
