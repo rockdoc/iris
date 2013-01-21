@@ -257,14 +257,16 @@ class NcmlDataset(object) :
             # variable element defines a coordinate variable which we can reify as an iris DimCoord
             # object.
             if var.name == var.shape and var.name in dim_names :
-                self._add_coord_variable(var)
+                dim_coord = self._add_coord_variable(var)
+                dim_coord.attributes['nctype'] = var.type   # store netcdf data type
                 self.logger.info("Added coordinate variable %s" % var.name)
 
             # If variable name is not a dimension name, but shape name/s is/are, then assume that
             # the variable element defines a data variable, possibly a scalar one, which we can
             # reify as an iris Cube object.
             elif var.name != var.shape : # and set(var.shape.split()) <= set(dim_names) :
-                self._add_data_variable(var)
+                cube = self._add_data_variable(var)
+                cube.attributes['nctype'] = var.type   # store netcdf data type
                 if var.shape :
                     self.logger.info("Added data variable %s as new cube" % var.name)
                 else :
@@ -309,12 +311,12 @@ class NcmlDataset(object) :
         # Process any <netcdf> nodes.
         if len(nc_nodes) :
             for node in nc_nodes :
-                self._handle_agg_netcdf_node(node)
+                self._handle_agg_netcdf_node(node, agg_elem)
 
         # Process any <scan> nodes.
         if len(scan_nodes) :
             for node in scan_nodes :
-                self._handle_agg_scan_node(node)
+                self._handle_agg_scan_node(node, agg_elem)
 
     def _handle_joinexisting(self, agg_elem) :
         """
@@ -337,12 +339,12 @@ class NcmlDataset(object) :
         # Process any <netcdf> nodes.
         if len(nc_nodes) :
             for node in nc_nodes :
-                self._handle_agg_netcdf_node(node, agg_type="joinExisting")
+                self._handle_agg_netcdf_node(node, agg_elem)
 
         # Process any <scan> nodes.
         if len(scan_nodes) :
             for node in scan_nodes :
-                self._handle_agg_scan_node(node, agg_type="joinExisting")
+                self._handle_agg_scan_node(node, agg_elem)
 
         # Get distinct variable names from the raw loaded cubelist.
         distinct_var_names = set([c.name() for c in self.cubelist])
@@ -383,26 +385,59 @@ class NcmlDataset(object) :
         """Process a joinNew aggregation node"""
         raise iris.exceptions.NotYetImplementedError()
 
-    def _handle_agg_netcdf_node(self, node, agg_type="union") :
+    def _handle_agg_netcdf_node(self, netcdf_node, agg_elem) :
         """Process an aggregation netcdf node"""
-        netcdf = NcmlElement(node)
+        netcdf = NcmlElement(netcdf_node)
         if not netcdf.location :
             raise NcmlSyntaxError("<netcdf> elements must include a 'location' attribute.")
         ncpath = netcdf.location
         if not ncpath.startswith('/') : ncpath = os.path.join(self.basedir, ncpath)
 
-        # load cubes from the specified netcdf file
+        # Read coordinate values from coordValue attribute, if present (join-type aggregations only).
+        # These coord values should be used to create a new DimCoord object, which is then
+        # associated with each cube loaded from the current netcdf file.
+        coord_values = None
+        if netcdf.coordValue and agg_elem.type.startswith('join') :
+            nctype = 'double'
+            for crd in self.dim_coords :
+                if crd.name() == agg_elem.dimName :
+                    nctype = crd.nctype
+                    break
+            coord_values = _cast_data_value(netcdf.coordValue, nctype)
+
+        # Load cubes from the specified netcdf file.
         self.logger.info("Scanning netCDF file '%s'..." % ncpath)
         cubelist = iris.fileformats.netcdf.load_cubes(ncpath, callback=_nc_load_callback)
+        
+        # If coordinate values were specified via a coordValue attribute, use them to create a
+        # new DimCoord object which is used in turn to replace the corresponding coord on each cube.
+        # Note that the NcML 2.2 schema doesn't provide a way to specify bounds values, AFAICT.
+        if coord_values :
+            for cube in cubelist :
+                oldcrd = cube.coord(agg_elem.dimName)
+                if oldcrd :
+                    try :
+                        points = np.array(coord_values, dtype=oldcrd.dtype)   # coerce data type
+                        newcrd = oldcrd.copy(points)
+                        newcrd.guess_bounds()
+                        cube.replace_coord(newcrd)
+                    except :
+                        errmsg = "Error trying to create replacement %s coordinate for variable %s" \
+                            % (agg_elem.dimName, cube.name())
+                        self.logger.warn(errmsg)
+                else :
+                    errmsg = "Unable to find coordinate object named %s on variable %s" \
+                        % (agg_elem.dimName, cube.name())
+                    self.logger.warn(errmsg)
 
-        # store the filename and cubelist associated with this <netcdf> node
+        # Store the filename and cubelist associated with this <netcdf> node
         self.part_filenames.append(ncpath)
         #self.part_cubelists.append(cubelist)
-        self._extend_cubelist(cubelist, unique_names=(agg_type=="union"))
+        self._extend_cubelist(cubelist, unique_names=(agg_elem.type=="union"))
 
-    def _handle_agg_scan_node(self, node, agg_type="union") :
+    def _handle_agg_scan_node(self, scan_node, agg_elem) :
         """Process an aggregation scan node"""
-        scan = NcmlElement(node)
+        scan = NcmlElement(scan_node)
         if not scan.location :
             raise NcmlSyntaxError("<scan> elements must include a 'location' attribute.")
 
@@ -424,7 +459,7 @@ class NcmlDataset(object) :
             self.part_filenames.append(ncpath)
             cubelist = iris.fileformats.netcdf.load_cubes(ncpath, callback=_nc_load_callback)
             #self.part_cubelists.append(cubelist)
-            self._extend_cubelist(cubelist, unique_names=(agg_type=="union"))
+            self._extend_cubelist(cubelist, unique_names=(agg_elem.type=="union"))
 
     # NOT CURRENTLY USED
     def _handle_remove_nodes(self, remove_nodelist) :
@@ -573,7 +608,9 @@ class NcmlDataset(object) :
         # create and store the DimCoord object for subsequent use
         dim_coord = iris.coords.DimCoord(np.array(points), **kw)
         dim_coord.var_name = var_elem.name
+        dim_coord.nctype = var_elem.type
         self.dim_coords.append(dim_coord)
+        return dim_coord
 
     def _add_data_variable(self, var_elem) :
         """Create a data variable (an iris Cube) from a <variable> element."""
@@ -633,9 +670,11 @@ class NcmlDataset(object) :
         data.shape = shape
         cube = iris.cube.Cube(data, dim_coords_and_dims=coords, **kw)
         cube.var_name = var_elem.name
+        cube.nctype = var_elem.type
         self.cubelist.append(cube)
         self.logger.debug("- cube min value: %s" % cube.data.min())
         self.logger.debug("- cube max value: %s" % cube.data.max())
+        return cube
 
     def _extend_cubelist(self, cubelist, unique_names=False) :
         """Append distinct cubes from cubelist to the NcMLDataset's current cubelist."""
@@ -668,7 +707,7 @@ def load_cubes(filenames, callback=None, **kwargs) :
     specified within an NcML file. The current implementation can only handle a single NcML file.
     """
     # Update logger object if necessary
-    log_level = kwargs.pop('log_level')
+    log_level = kwargs.pop('log_level', None)
     if log_level : _update_logger(log_level)
 
     if isinstance(filenames, (list,tuple)) :
@@ -813,6 +852,7 @@ def _concat_dim_coords(coord_list, sort=True, reverse=False) :
     the DimCoords are concatenated in ascending order of their first point. Set the reverse keyword
     to True to concatenate in descending order. Set the sort keyword to False to disable sorting.
     """
+    # TODO: check that coord object metadata (std name, units, calendar) are equal across input list 
     if sort : coord_list.sort(_coord_sorter, reverse=reverse)
     points = np.concatenate([c.points for c in coord_list], axis=0)
     if coord_list[0].has_bounds() :
