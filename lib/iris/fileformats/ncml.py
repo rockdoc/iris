@@ -6,7 +6,7 @@ Iris i/o module for loading NcML v2.2 files. Current functionality is limited to
 * only handles aggregations of netcdf files
 * union-type aggregation based on <netcdf> or <scan> elements
 * joinExisting-type aggregation for simple 1D aggregation dimensions only
-* rename or remove variables (= cubes)
+* rename or remove data variables (= cubes)
 * add, override, rename or remove attributes (global or per-variable)
 * create new 1D coordinate variables as DimCoord objects
 
@@ -17,6 +17,7 @@ Functionality that is expressly excluded:
 * forecastModelRun* elements
 * the Structure data type
 * nested variables
+* nested aggregations
 
 TO DO:
 
@@ -169,6 +170,11 @@ class NcmlDataset(object) :
         dim_nodelist = doc.getElementsByTagName('dimension')
         if len(dim_nodelist) : self._handle_dimensions(dim_nodelist)
 
+        # process any coordinate <variable> nodes - these need to be created in advance of any
+        # aggregation or data variable nodes
+        var_nodelist = doc.getElementsByTagName('variable')
+        if len(var_nodelist) : self._handle_coord_variables(var_nodelist)
+
         # process an <aggregation> node, if present
         agg_nodelist= doc.getElementsByTagName('aggregation')
         if len(agg_nodelist) : self._handle_aggregation(agg_nodelist[0])
@@ -177,9 +183,8 @@ class NcmlDataset(object) :
         att_nodelist = [n for n in doc.getElementsByTagName('attribute') if n.parentNode.tagName == 'netcdf']
         if len(att_nodelist) : self._handle_global_attributes(att_nodelist)
 
-        # process any <variable> nodes
-        var_nodelist = doc.getElementsByTagName('variable')
-        if len(var_nodelist) : self._handle_variables(var_nodelist)
+        # process any data <variable> nodes
+        if len(var_nodelist) : self._handle_data_variables(var_nodelist)
 
         # process any items in the remove list
         self._process_remove_list()
@@ -195,8 +200,9 @@ class NcmlDataset(object) :
         dim = NcmlElement(dim_node)
         if not dim.name :
             raise NcmlSyntaxError("<dimension> elements must include a 'name' attribute.")
+        dim.length = 0 if dim.length is None else int(dim.length)
         self.dimensions.append(dim)
-        self.logger.info("Added dimension %s" % dim.name)
+        self.logger.info("Added dimension %s with length %d" % (dim.name, dim.length))
 
     def _handle_global_attributes(self, att_nodelist) :
         """Process all attribute nodes"""
@@ -230,48 +236,39 @@ class NcmlDataset(object) :
         for cube in cubelist :
             if att.orgName :
                 old_val = cube.attributes.pop(att.orgName, None)
-            cube.attributes[att.name] = _cast_data_value(att.value, att.type, sep=att.separator)
+            att_val = _parse_text_string(att.value, att.type, sep=att.separator)
+            if isinstance(att_val, basestring) or len(att_val) > 1 :
+                cube.attributes[att.name] = att_val     # string or number array
+            else :
+                cube.attributes[att.name] = att_val[0]  # single number
 
-    def _handle_variables(self, var_nodelist) :
-        """Process all variable nodes"""
-        self.logger.info("Processing variable nodes...")
+    def _handle_data_variables(self, var_nodelist) :
+        """Process any data variable nodes"""
+        self.logger.info("Processing data variable elements...")
         for var_node in var_nodelist :
-            self._handle_variable(var_node)
+            self._handle_data_variable(var_node)
 
-    def _handle_variable(self, var_node) :
-        """Process a single variable node"""
+    def _handle_data_variable(self, var_node) :
+        """Process a data variable node"""
         var = NcmlElement(var_node)
-        if not var.name :
-            raise NcmlSyntaxError("<variable> elements must include a 'name' attribute.")
-        if not var.type :
-            raise NcmlSyntaxError("<variable> elements must include a 'type' attribute.")
+        if self._is_coord_variable(var) : return
         self.logger.info("Variable element: name: '%s', type: '%s'" % (var.name, var.type))
 
-        # check to see if the variable contains a nested <values> element (i.e. data)
+        # Check to see if the variable contains a nested <values> element (i.e. data).
         val_nodes = var_node.getElementsByTagName('values')
         has_values = len(val_nodes) == 1
         
+        # If data values have been specified then assume that the current <variable> element defines
+        # a data variable, possibly a scalar one, which we can reify as a new iris Cube object.
         if has_values :
-            dim_names = [dim.name for dim in self.dimensions]
-            # If the variable's name and shape match a single dimension name, then assume that the
-            # variable element defines a coordinate variable which we can reify as an iris DimCoord
-            # object.
-            if var.name == var.shape and var.name in dim_names :
-                dim_coord = self._add_coord_variable(var)
-                dim_coord.attributes['nctype'] = var.type   # store netcdf data type
-                self.logger.info("Added coordinate variable %s" % var.name)
+            cube = self._add_data_variable(var)
+            if var.shape :
+                self.logger.info("Added %dD data variable %s as new cube" % (len(cube.shape), var.name))
+            else :
+                self.logger.info("Added scalar variable %s as new cube" % var.name)
 
-            # If variable name is not a dimension name, but shape name/s is/are, then assume that
-            # the variable element defines a data variable, possibly a scalar one, which we can
-            # reify as an iris Cube object.
-            elif var.name != var.shape : # and set(var.shape.split()) <= set(dim_names) :
-                cube = self._add_data_variable(var)
-                cube.attributes['nctype'] = var.type   # store netcdf data type
-                if var.shape :
-                    self.logger.info("Added data variable %s as new cube" % var.name)
-                else :
-                    self.logger.info("Added scalar data variable %s as new cube" % var.name)
-            
+        # Otherwise assume that the current <variable> element is merely modifying some aspect(s)
+        # of an existing cube loaded from a netcdf file. 
         else :
             # if necessary, rename the variable from orgName to var.name
             if var.orgName :
@@ -285,6 +282,18 @@ class NcmlDataset(object) :
             for att_node in att_nodelist :
                 self._handle_attribute(att_node, var.name)
         
+    def _handle_coord_variables(self, var_nodelist) :
+        """
+        Process any coordinate variable nodes. Refer to the _is_coord_variable() method to see how
+        coordinate variables are distinguished.
+        """
+        self.logger.info("Processing coordinate variable elements...")
+        for var_node in var_nodelist :
+            var = NcmlElement(var_node)
+            if self._is_coord_variable(var) :
+                dim_coord = self._add_coord_variable(var)
+                self.logger.info("Added coordinate variable %s of type %s" % (var.name, var.type))
+
     def _handle_aggregation(self, agg_node) :
         """Process a single aggregation node"""
         agg = NcmlElement(agg_node)
@@ -304,7 +313,7 @@ class NcmlDataset(object) :
         coordinate variables must match exactly across all of the nominated files. The current
         implementation does not check that this holds true.
         """
-        self.logger.info("Processing union aggregation node...")
+        self.logger.info("Processing union aggregation element...")
         nc_nodes = agg_elem.node.getElementsByTagName('netcdf')
         scan_nodes = agg_elem.node.getElementsByTagName('scan')
 
@@ -328,7 +337,7 @@ class NcmlDataset(object) :
             the aggregation dimension are treated as in a Union dataset, i.e. skipped if one with
             that name already exists.
         """
-        self.logger.info("Processing joinExisting aggregation node...")
+        self.logger.info("Processing joinExisting aggregation element...")
         if not agg_elem.dimName :
             errmsg = "<aggregation> elements of type 'joinExisting' must include a 'dimName' attribute."
             raise NcmlSyntaxError(errmsg)
@@ -393,42 +402,20 @@ class NcmlDataset(object) :
         ncpath = netcdf.location
         if not ncpath.startswith('/') : ncpath = os.path.join(self.basedir, ncpath)
 
-        # Read coordinate values from coordValue attribute, if present (join-type aggregations only).
-        # These coord values should be used to create a new DimCoord object, which is then
-        # associated with each cube loaded from the current netcdf file.
-        coord_values = None
-        if netcdf.coordValue and agg_elem.type.startswith('join') :
-            nctype = 'double'
-            for crd in self.dim_coords :
-                if crd.name() == agg_elem.dimName :
-                    nctype = crd.nctype
-                    break
-            coord_values = _cast_data_value(netcdf.coordValue, nctype)
-
         # Load cubes from the specified netcdf file.
         self.logger.info("Scanning netCDF file '%s'..." % ncpath)
         cubelist = iris.fileformats.netcdf.load_cubes(ncpath, callback=_nc_load_callback)
         
         # If coordinate values were specified via a coordValue attribute, use them to create a
-        # new DimCoord object which is used in turn to replace the corresponding coord on each cube.
-        # Note that the NcML 2.2 schema doesn't provide a way to specify bounds values, AFAICT.
-        if coord_values :
-            for cube in cubelist :
-                oldcrd = cube.coord(agg_elem.dimName)
-                if oldcrd :
-                    try :
-                        points = np.array(coord_values, dtype=oldcrd.dtype)   # coerce data type
-                        newcrd = oldcrd.copy(points)
-                        newcrd.guess_bounds()
-                        cube.replace_coord(newcrd)
-                    except :
-                        errmsg = "Error trying to create replacement %s coordinate for variable %s" \
-                            % (agg_elem.dimName, cube.name())
-                        self.logger.warn(errmsg)
-                else :
-                    errmsg = "Unable to find coordinate object named %s on variable %s" \
-                        % (agg_elem.dimName, cube.name())
-                    self.logger.warn(errmsg)
+        # new DimCoord object which will be used later to apply a join operation to the cubelist.
+        # Note that the NcML 2.2 schema doesn't provide a way to specify bounds values, so we'll
+        # guess those.
+        coord_values = None
+        if netcdf.coordValue and agg_elem.type.startswith('join') :
+            nctype = 'double'   # assume type double, even though they may not be
+            coord_values = _parse_text_string(netcdf.coordValue, nctype)
+            if coord_values :
+                _extend_dim_coord(agg_elem.dimName, coord_values)
 
         # Store the filename and cubelist associated with this <netcdf> node
         self.part_filenames.append(ncpath)
@@ -574,17 +561,64 @@ class NcmlDataset(object) :
         d = dict(name=obj_name, type=obj_type, parent_name=parent_name, parent_type=parent_type)
         return d in self.removelist
 
+    def _is_coord_variable(self, var_elem) :
+        """
+        Return True if var_elem represents a coordinate variable element. A coordinate variable is
+        recognised by having its name attribute identical to its shape attribute, and by having its
+        name equal to the name of a previously defined dimension element, e.g.
+            <dimension name='time' length='30'/>
+            <variable name='time' type='int' shape='time'> ... </variable> 
+        """
+        if not var_elem.name :
+            raise NcmlSyntaxError("<variable> elements must include a 'name' attribute.")
+        if not var_elem.type :
+            errmsg = "<variable> element named %s does not contain a 'type' attribute." \
+                % var_elem.name
+            self.logger.error(errmsg)
+            raise NcmlSyntaxError("<variable> elements must include a 'type' attribute.")
+        dim_names = [dim.name for dim in self.dimensions]
+        return (var_elem.name == var_elem.shape and var_elem.name in dim_names)
+
+    def _is_data_variable(self, var_elem) :
+        """
+        Return True if var_elem represents a data variable element. A data variable is recognised by
+        having its name attribute NOT equal to its shape attribute, and by having its name NOT equal
+        to any if defined previously defined dimension element, e.g.
+            <variable name='tas' type='float' shape='mydim'> ... </variable>
+        This definition is essentially the inverse of the _is_coord_variable method (which we could
+        invoke as a proxy). Note that the shape attribute is not obligatory for data variables
+        (in which case they are treated as scalar variables). 
+        """
+        if not var_elem.name :
+            raise NcmlSyntaxError("<variable> elements must include a 'name' attribute.")
+        if not var_elem.type :
+            errmsg = "<variable> element named %s does not contain a 'type' attribute." \
+                % var_elem.name
+            self.logger.error(errmsg)
+            raise NcmlSyntaxError("<variable> elements must include a 'type' attribute.")
+        dim_names = [dim.name for dim in self.dimensions]
+        return (var_elem.name != var_elem.shape and var_elem.name not in dim_names)
+
     def _add_coord_variable(self, var_elem) :
         """Create a coordinate variable (an iris DimCoord object) from a <variable> element."""
         nodes = var_elem.node.getElementsByTagName('values')
         if not nodes :
             raise NcmlSyntaxError("A <values> element is required to create a coordinate variable")
 
+        # TODO: need to handle the case whereby coordinate values may be provided later on by
+        #       coordValue attributes on <netcdf> elements in a joinExisting or joinNew aggregation
+
         val_node = nodes[0]
         values = NcmlElement(val_node)
 
-        # compute or retrieve coordinate values
+        # Compute coordinate values from start/increment/npts attributes, else read them from the
+        # child text node.
         if values.start :
+            if values.npts :
+                npts = int(values.npts)
+            else :
+                for dim in self.dimensions :
+                    if var_elem.shape == dim.name : npts = dim.length
             try :
                 start = int(values.start)
                 inc = int(values.increment)
@@ -592,23 +626,24 @@ class NcmlDataset(object) :
                 start = float(values.start)
                 inc = float(values.increment)
             points = []
-            for i in range(int(values.npts)) :
+            for i in range(npts) :
                 points.append(start + i*inc)
         else :
             text_values = _get_node_text(val_node)
-            points = _cast_data_value(text_values, var_elem.type, sep=values.separator)
+            points = _parse_text_string(text_values, var_elem.type, sep=values.separator)
 
-        # set any keyword arguments from nested <attribute> elements
+        # Set any keyword arguments from nested <attribute> elements.
         kw = dict(standard_name=None, long_name=None, units='1')
         att_nodelist = var_elem.node.getElementsByTagName('attribute')
         for node in att_nodelist :
             name = node.getAttribute('name')
             if name in kw : kw[name] = node.getAttribute('value')
         
-        # create and store the DimCoord object for subsequent use
+        # Create and store the DimCoord object for subsequent use.
         dim_coord = iris.coords.DimCoord(np.array(points), **kw)
         dim_coord.var_name = var_elem.name
         dim_coord.nctype = var_elem.type
+        dim_coord.guess_bounds()
         self.dim_coords.append(dim_coord)
         return dim_coord
 
@@ -616,7 +651,7 @@ class NcmlDataset(object) :
         """Create a data variable (an iris Cube) from a <variable> element."""
         nodes = var_elem.node.getElementsByTagName('values')
         if not nodes :
-            raise NcmlSyntaxError("A <values> element is required to create a coordinate variable")
+            raise NcmlSyntaxError("A <values> element is required to create a data variable")
 
         val_node = nodes[0]
         values = NcmlElement(val_node)
@@ -634,7 +669,7 @@ class NcmlDataset(object) :
                 points.append(start + i*inc)
         else :
             text_values = _get_node_text(val_node)
-            points = _cast_data_value(text_values, var_elem.type, sep=values.separator)
+            points = _parse_text_string(text_values, var_elem.type, sep=values.separator)
 
         # set any keyword arguments from nested <attribute> elements
         kw = dict(standard_name=None, long_name=None, units='1', cell_methods=None)
@@ -672,6 +707,7 @@ class NcmlDataset(object) :
         cube.var_name = var_elem.name
         cube.nctype = var_elem.type
         self.cubelist.append(cube)
+        self.logger.debug("- cube shape: %s" % str(data.shape))
         self.logger.debug("- cube min value: %s" % cube.data.min())
         self.logger.debug("- cube max value: %s" % cube.data.max())
         return cube
@@ -688,6 +724,37 @@ class NcmlDataset(object) :
             else :
                 self.cubelist.append(cube)
                 self.logger.info("Added netCDF variable %s" % cube.var_name)
+
+    def _extend_dim_coord(self, dim_name, coord_values) :
+        """Create or extend the DimCoord object associated with name dim_name."""
+        # See if there's an existing DimCoord object with the passed in name.
+        dim_num = 0
+        dim_coord = None
+        for i,crd in enumerate(self.dim_coords) :
+            if crd.var_name == dim_name :
+                dim_num = i
+                dim_coord = crd
+                break
+
+        try :
+            # Extend an existing DimCoord object.
+            if dim_coord :
+                points = np.array(coord_values, dtype=dim_coord.points.dtype)
+                dim_coord = dim_coord.copy(points)
+                dim_coord.guess_bounds()
+                self.dim_coords[dim_num] = dim_coord
+            # Create a new DimCoord object.
+            else :
+                points = np.array(coord_values, dtype=coord_values.dtype)
+                # FIXME: what about std name and units?
+                dim_coord = iris.coords.DimCoord(points, long_name=dim_name)
+                dim_coord.var_name = dim_name
+                dim_coord.guess_bounds()
+                self.dim_coords.append(dim_coord)
+        except :
+            errmsg = "Error trying to create or extend coordinate variable for dimension %s" \
+                % dim_name
+            self.logger.error(errmsg)
 
     def _update_cube_attributes(self, attrs) :
         """Override any cubes attributes with those specified in the attrs dict argument."""
@@ -775,7 +842,11 @@ def _get_node_text(node) :
     for child in node.childNodes :
         if child.nodeType == child.TEXT_NODE :
             text.append(child.data)
-    return ''.join(text)
+    text = ''.join(text)
+    if re.match('\s+$', text) :   # test for all whitespace
+        return ''
+    else :
+        return text
 
 def _get_coord_list(cubelist) :
     """
@@ -910,33 +981,31 @@ def _walk_dir_tree(topdir, recurse=True, regex=None, min_age=None, sort=False) :
             yield curr_file
         if not recurse : break
  
-def _cast_data_value(value, nctype, sep=None) :
+def _parse_text_string(text, nctype='String', sep=None) :
     """
-    Cast the specified text value to the NcML/NetCDF data type given by nctype. By default, in
-    NcML documents, values in lists are separated by whitespace.
+    Parse the specified text string into a (possibly length-one) array of values of type nctype,
+    being one of the recognised NcML/NetCDF data types ('byte', 'int', etc). As per the NcML default,
+    values in lists are separated by arbitrary amounts of whitespace. An alternative separator may
+    be set using the sep argument, in which case values are separated by single occurrences of the
+    specified separator.
+    
     NOTE: there is no support at present for the 'Structure' data type described in the NcML spec.
     """
     if nctype in ('char', 'string', 'String') :
-        return value
+        return text
     elif nctype == 'byte' :
-        vlist = [np.int8(x) for x in value.split(sep)]
+        vlist = [np.int8(x) for x in text.split(sep)]
     elif nctype == 'short' :
-        vlist = [np.int16(x) for x in value.split(sep)]
-    elif nctype == 'int' :
-        vlist = [np.int32(x) for x in value.split(sep)]
-    elif nctype == 'long' :   # synonym for int in NcML/CDL grammar
-        vlist = [np.int32(x) for x in value.split(sep)]
+        vlist = [np.int16(x) for x in text.split(sep)]
+    elif nctype == 'int' or nctype == 'long' :
+        vlist = [np.int32(x) for x in text.split(sep)]
     elif nctype == 'float' :
-        vlist = [np.float32(x) for x in value.split(sep)]
+        vlist = [np.float32(x) for x in text.split(sep)]
     elif nctype == 'double' :
-        vlist = [np.float64(x) for x in value.split(sep)]
+        vlist = [np.float64(x) for x in text.split(sep)]
     else :
         raise iris.exceptions.DataLoadError("Unsupported NcML attribute data type: %s" % nctype)
-
-    if len(vlist) == 1 :
-        return vlist[0]
-    else :
-        return vlist
+    return vlist
 
 def test(ncml_filename) :
     """Rudimentary test function"""
