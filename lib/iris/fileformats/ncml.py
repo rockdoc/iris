@@ -25,6 +25,7 @@ TO DO:
 * joinNew aggregation
 * handle dateFormatMark for join-type aggregations
 * handle coordValue attribute for join-type aggregations
+* handle timeUnitsChange attribute for join-type aggregations
 * support loading of non-netcdf data formats?
 * add sphinx markup throughout
 """
@@ -357,6 +358,7 @@ class NcmlDataset(object) :
 
         # Get distinct variable names from the raw loaded cubelist.
         distinct_var_names = set([c.name() for c in self.cubelist])
+        self.logger.debug("Distinct variable names: %s" % [x for x in distinct_var_names])
 
         # Create an empty cubelist to hold the joined cubes.
         joined_cubes = iris.cube.CubeList()
@@ -367,8 +369,13 @@ class NcmlDataset(object) :
         # All other variables are simply copied over as-is.
         for var_name in distinct_var_names :
             var_cubes = [c for c in self.cubelist if c.name() == var_name]
-            if len(var_cubes) > 1 and var_cubes[0].coords(name=agg_elem.dimName, dim_coords=True) :
+            agg_dim_coords = var_cubes[0].coords(name=agg_elem.dimName, dim_coords=True)
+            self.logger.debug("Number of cubes for variable %s: %d" % (var_name, len(var_cubes)))
+            self.logger.debug("Number of agg dimension coords: %d" % len(agg_dim_coords))
+            if len(var_cubes) > 1 and agg_dim_coords :
                 try :
+                    self.logger.info("Attempting to merge %d cubes with name %s" \
+                        % (len(var_cubes),var_name))
                     tmp_cube = _concat_cubes(var_cubes, agg_elem.dimName)
                     joined_cubes.append(tmp_cube)
                     for cube in var_cubes : del cube
@@ -383,7 +390,7 @@ class NcmlDataset(object) :
         after = len(joined_cubes)
         if before != after :
             self.cubelist = joined_cubes
-            msg = "Reduced %d input cubes down to %d after join along %s dimension" \
+            msg = "Merged %d input cubes into %d after join along %s dimension" \
                 % (before, after, agg_elem.dimName)
             self.logger.info(msg)
         else :
@@ -408,14 +415,24 @@ class NcmlDataset(object) :
         
         # If coordinate values were specified via a coordValue attribute, use them to create a
         # new DimCoord object which will be used later to apply a join operation to the cubelist.
-        # Note that the NcML 2.2 schema doesn't provide a way to specify bounds values, so we'll
-        # guess those.
         coord_values = None
         if netcdf.coordValue and agg_elem.type.startswith('join') :
-            nctype = 'double'   # assume type double, even though they may not be
-            coord_values = _parse_text_string(netcdf.coordValue, nctype)
-            if coord_values :
-                _extend_dim_coord(agg_elem.dimName, coord_values)
+            agg_dim_crd = self._find_agg_dim_coord(agg_elem.dimName)
+            if not agg_dim_crd :
+                raise iris.exceptions.DataLoadError("Unable to find aggregation dimension object.")
+            coord_values = _parse_text_string(netcdf.coordValue, agg_dim_crd.nctype)
+            # FIXME: if only a single coordValue is defined it might be more effective to store it
+            # as a scalar auxiliary coord on each cube loaded above
+            self._extend_agg_dim_coord(agg_elem.dimName, agg_dim_crd.nctype, coord_values)
+
+#                for cube in cubelist :
+#                    oldcrd = cube.coords(name=agg_elem.dimName, dim_coords=True)
+#                    if not oldcrd : continue
+#                    newcrd = agg_dim_crd.copy(coord_values)
+#                    cube.remove_coord(oldcrd[0])
+#                    cube.add_dim_coord(newcrd, 0)
+#                    self.logger.debug("Replaced %s dimension coordinate on cube %s" \
+#                        % (agg_elem.dimName, cube.name()))
 
         # Store the filename and cubelist associated with this <netcdf> node
         self.part_filenames.append(ncpath)
@@ -602,35 +619,37 @@ class NcmlDataset(object) :
     def _add_coord_variable(self, var_elem) :
         """Create a coordinate variable (an iris DimCoord object) from a <variable> element."""
         nodes = var_elem.node.getElementsByTagName('values')
-        if not nodes :
-            raise NcmlSyntaxError("A <values> element is required to create a coordinate variable")
-
-        # TODO: need to handle the case whereby coordinate values may be provided later on by
-        #       coordValue attributes on <netcdf> elements in a joinExisting or joinNew aggregation
-
-        val_node = nodes[0]
-        values = NcmlElement(val_node)
-
-        # Compute coordinate values from start/increment/npts attributes, else read them from the
-        # child text node.
-        if values.start :
-            if values.npts :
-                npts = int(values.npts)
+        if nodes :
+            val_node = nodes[0]
+            values = NcmlElement(val_node)
+            # Compute coordinate values from start/increment/npts attributes, else read them from the
+            # child text node.
+            if values.start :
+                if values.npts :
+                    npts = int(values.npts)
+                else :
+                    for dim in self.dimensions :
+                        if var_elem.shape == dim.name : npts = dim.length
+                try :
+                    start = int(values.start)
+                    inc = int(values.increment)
+                except :
+                    start = float(values.start)
+                    inc = float(values.increment)
+                points = []
+                for i in range(npts) :
+                    points.append(start + i*inc)
             else :
-                for dim in self.dimensions :
-                    if var_elem.shape == dim.name : npts = dim.length
-            try :
-                start = int(values.start)
-                inc = int(values.increment)
-            except :
-                start = float(values.start)
-                inc = float(values.increment)
-            points = []
-            for i in range(npts) :
-                points.append(start + i*inc)
+                text_values = _get_node_text(val_node)
+                points = _parse_text_string(text_values, var_elem.type, sep=values.separator)
+                if not points : points = []
+            self.logger.debug("First few coordinate <values>: %s" % points[:10])
+
+        # No <values> element present: assume that coordinates will be obtained later on from
+        # coordValue attributes on <netcdf> elements nested in a join-type aggregation.
         else :
-            text_values = _get_node_text(val_node)
-            points = _parse_text_string(text_values, var_elem.type, sep=values.separator)
+            points = []
+            self.logger.debug("No <values> defined for coordinate variable "+var_elem.name)
 
         # Set any keyword arguments from nested <attribute> elements.
         kw = dict(standard_name=None, long_name=None, units='1')
@@ -640,10 +659,10 @@ class NcmlDataset(object) :
             if name in kw : kw[name] = node.getAttribute('value')
         
         # Create and store the DimCoord object for subsequent use.
-        dim_coord = iris.coords.DimCoord(np.array(points), **kw)
+        dim_coord = iris.coords.DimCoord(np.array(points, dtype=var_elem.type), **kw)
         dim_coord.var_name = var_elem.name
         dim_coord.nctype = var_elem.type
-        dim_coord.guess_bounds()
+        if len(dim_coord.points) > 1 : dim_coord.guess_bounds()
         self.dim_coords.append(dim_coord)
         return dim_coord
 
@@ -725,8 +744,8 @@ class NcmlDataset(object) :
                 self.cubelist.append(cube)
                 self.logger.info("Added netCDF variable %s" % cube.var_name)
 
-    def _extend_dim_coord(self, dim_name, coord_values) :
-        """Create or extend the DimCoord object associated with name dim_name."""
+    def _extend_agg_dim_coord(self, dim_name, dim_type, coord_values) :
+        """Create or extend the aggregation dimension Coord object associated with name dim_name."""
         # See if there's an existing DimCoord object with the passed in name.
         dim_num = 0
         dim_coord = None
@@ -740,21 +759,34 @@ class NcmlDataset(object) :
             # Extend an existing DimCoord object.
             if dim_coord :
                 points = np.array(coord_values, dtype=dim_coord.points.dtype)
+                points = np.append(dim_coord.points, points)
                 dim_coord = dim_coord.copy(points)
-                dim_coord.guess_bounds()
+                if len(dim_coord.points) > 1 : dim_coord.guess_bounds()
                 self.dim_coords[dim_num] = dim_coord
+                self.logger.debug("Extended DimCoord object for aggregation dimension "+dim_name)
             # Create a new DimCoord object.
             else :
-                points = np.array(coord_values, dtype=coord_values.dtype)
+                points = np.array(coord_values)
                 # FIXME: what about std name and units?
                 dim_coord = iris.coords.DimCoord(points, long_name=dim_name)
                 dim_coord.var_name = dim_name
-                dim_coord.guess_bounds()
+                dim_coord.nctype = dim_type
+                if len(dim_coord.points) > 1 : dim_coord.guess_bounds()
                 self.dim_coords.append(dim_coord)
-        except :
-            errmsg = "Error trying to create or extend coordinate variable for dimension %s" \
+                self.logger.debug("Created DimCoord object for aggregation dimension "+dim_name)
+        except Exception, exc :
+            errmsg = "Error trying to create or extend aggregation coordinate for dimension %s" \
                 % dim_name
             self.logger.error(errmsg)
+            self.logger.error(str(exc))
+        
+        return dim_coord
+
+    def _find_agg_dim_coord(self, dim_name) :
+        """Find the aggregation dimension Coord object associated with name dim_name."""
+        for crd in self.dim_coords :
+            if crd.var_name == dim_name : return crd
+        return None
 
     def _update_cube_attributes(self, attrs) :
         """Override any cubes attributes with those specified in the attrs dict argument."""
@@ -793,7 +825,7 @@ def load_cubes(filenames, callback=None, **kwargs) :
     try :
         ncml_dataset = NcmlDataset(ncml_file, **kwargs)
     except Exception, exc :
-        print str(exc)
+        print >>sys.stderr, str(exc)
         raise iris.exceptions.DataLoadError("Error trying to load NcML dataset")
     
     for cube in ncml_dataset.get_cubes() :
@@ -860,34 +892,39 @@ def _get_coord_list(cubelist) :
             if coord not in coord_list : coord_list.append(coord)
     return coord_list
 
-def _concat_cubes(cubelist, dim_name) :
+def _concat_cubes(cubelist, dim_name, agg_dim_coord=None) :
     """
     Concatenate the passed in cubelist along the specified dimension. The cube data must be concat-
     enated in the same order as the corresponding dimension coordinates, be they increasing or
     decreasing. The current implementation copies any cube attributes from the first input cube.
     """
-    # Retrieve the list of DimCoord objects associated with the input cubes.
-    dim_coord_list = []
-    for cube in cubelist :
-        dim_coord_list.extend(cube.coords(name=dim_name, dim_coords=True))
-
-    # Since cubes don't share coord objects, the lengths of the cube and coord lists should be
-    # the same.
-    if len(dim_coord_list) != len(cubelist) :
-        errmsg = "Number of coordinate objects (%d) does not match number of cubes (%d)" \
-            % (len(dim_coord_list), len(cubelist))
-        raise iris.exceptions.DataLoadError(errmsg)
-
-    # Sort the cube list and dim coord list in tandem. Do a reverse sort if the first DimCoord
-    # object is monotonic decreasing.
-    reverse = dim_coord_list[0].points[0] > dim_coord_list[0].points[-1]
-    sort_key = lambda i: i[0].points[0]
-    dim_coord_list, cubelist = zip(*sorted(zip(dim_coord_list, cubelist), key=sort_key,
-        reverse=reverse))
-
-    # Create a new DimCoord object from dim_coord_list, which has just been sorted.
-    agg_dim_coord = _concat_dim_coords(dim_coord_list, sort=False)
-    logger.debug("Shape of aggregated coordinate data: %s" % str(agg_dim_coord.points.shape))
+    if agg_dim_coord :
+        # TODO: sort input cubes to match aggregation coordinates 
+        logger.debug("Shape of aggregated coordinate data: %s" % str(agg_dim_coord.points.shape))
+    
+    else :
+        # Retrieve the list of DimCoord objects associated with the input cubes.
+        dim_coord_list = []
+        for cube in cubelist :
+            dim_coord_list.extend(cube.coords(name=dim_name, dim_coords=True))
+    
+        # Since cubes don't share coord objects, the lengths of the cube and coord lists should be
+        # the same.
+        if len(dim_coord_list) != len(cubelist) :
+            errmsg = "Number of coordinate objects (%d) does not match number of cubes (%d)" \
+                % (len(dim_coord_list), len(cubelist))
+            raise iris.exceptions.DataLoadError(errmsg)
+    
+        # Sort the cube list and dim coord list in tandem. Do a reverse sort if the first DimCoord
+        # object is monotonic decreasing.
+        reverse = dim_coord_list[0].points[0] > dim_coord_list[0].points[-1]
+        sort_key = lambda i: i[0].points[0]
+        dim_coord_list, cubelist = zip(*sorted(zip(dim_coord_list, cubelist), key=sort_key,
+            reverse=reverse))
+    
+        # Create a new DimCoord object from dim_coord_list, which was sorted earlier.
+        agg_dim_coord = _concat_dim_coords(dim_coord_list, sort=False)
+        logger.debug("Shape of aggregated coordinate data: %s" % str(agg_dim_coord.points.shape))
 
     # Concatenate all the data arrays from the input cubes.
     # Is this the most efficient idiom? Preferable to np.concatenate I think.
