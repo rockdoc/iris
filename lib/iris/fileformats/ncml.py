@@ -38,7 +38,8 @@ from xml.dom.minidom import parse
 
 # default logging options
 DEFAULT_LOG_LEVEL  = logging.WARN
-DEFAULT_LOG_FORMAT = "[%(name)s.%(funcName)s] %(levelname)s: %(message)s"
+DEFAULT_LOG_FORMAT = "[%(name)s] %(levelname)s: %(message)s"
+#DEFAULT_LOG_FORMAT = "[%(name)s.%(funcName)s] %(levelname)s: %(message)s"
 
 # Define lists of permissible attributes for various NcML 2.2 tags
 att_namelists = {
@@ -293,7 +294,8 @@ class NcmlDataset(object) :
             var = NcmlElement(var_node)
             if self._is_coord_variable(var) :
                 dim_coord = self._add_coord_variable(var)
-                self.logger.info("Added coordinate variable %s of type %s" % (var.name, var.type))
+                self.logger.info("Added coordinate variable %s of type %s, length %d" \
+                    % (var.name, var.type, len(dim_coord.points)))
 
     def _handle_aggregation(self, agg_node) :
         """Process a single aggregation node"""
@@ -358,7 +360,6 @@ class NcmlDataset(object) :
 
         # Get distinct variable names from the raw loaded cubelist.
         distinct_var_names = set([c.name() for c in self.cubelist])
-        self.logger.debug("Distinct variable names: %s" % [x for x in distinct_var_names])
 
         # Create an empty cubelist to hold the joined cubes.
         joined_cubes = iris.cube.CubeList()
@@ -370,8 +371,6 @@ class NcmlDataset(object) :
         for var_name in distinct_var_names :
             var_cubes = [c for c in self.cubelist if c.name() == var_name]
             agg_dim_coords = var_cubes[0].coords(name=agg_elem.dimName, dim_coords=True)
-            self.logger.debug("Number of cubes for variable %s: %d" % (var_name, len(var_cubes)))
-            self.logger.debug("Number of agg dimension coords: %d" % len(agg_dim_coords))
             if len(var_cubes) > 1 and agg_dim_coords :
                 try :
                     self.logger.info("Attempting to merge %d cubes with name %s" \
@@ -424,15 +423,6 @@ class NcmlDataset(object) :
             # FIXME: if only a single coordValue is defined it might be more effective to store it
             # as a scalar auxiliary coord on each cube loaded above
             self._extend_agg_dim_coord(agg_elem.dimName, agg_dim_crd.nctype, coord_values)
-
-#                for cube in cubelist :
-#                    oldcrd = cube.coords(name=agg_elem.dimName, dim_coords=True)
-#                    if not oldcrd : continue
-#                    newcrd = agg_dim_crd.copy(coord_values)
-#                    cube.remove_coord(oldcrd[0])
-#                    cube.add_dim_coord(newcrd, 0)
-#                    self.logger.debug("Replaced %s dimension coordinate on cube %s" \
-#                        % (agg_elem.dimName, cube.name()))
 
         # Store the filename and cubelist associated with this <netcdf> node
         self.part_filenames.append(ncpath)
@@ -758,22 +748,26 @@ class NcmlDataset(object) :
         try :
             # Extend an existing DimCoord object.
             if dim_coord :
+                npoints = len(coord_values)
                 points = np.array(coord_values, dtype=dim_coord.points.dtype)
                 points = np.append(dim_coord.points, points)
                 dim_coord = dim_coord.copy(points)
                 if len(dim_coord.points) > 1 : dim_coord.guess_bounds()
                 self.dim_coords[dim_num] = dim_coord
-                self.logger.debug("Extended DimCoord object for aggregation dimension "+dim_name)
+                self.logger.debug("Extended aggregation coordinate variable '%s' with %d value%s" \
+                    % (dim_name, npoints, 's'[npoints==1:]))
             # Create a new DimCoord object.
             else :
+                npoints = len(coord_values)
                 points = np.array(coord_values)
                 # FIXME: what about std name and units?
                 dim_coord = iris.coords.DimCoord(points, long_name=dim_name)
                 dim_coord.var_name = dim_name
                 dim_coord.nctype = dim_type
-                if len(dim_coord.points) > 1 : dim_coord.guess_bounds()
+                if npoints > 1 : dim_coord.guess_bounds()
                 self.dim_coords.append(dim_coord)
-                self.logger.debug("Created DimCoord object for aggregation dimension "+dim_name)
+                self.logger.debug("Created aggregation coordinate variable '%s' with %d value%s" \
+                    % (dim_name, npoints, 's'[npoints==1:]))
         except Exception, exc :
             errmsg = "Error trying to create or extend aggregation coordinate for dimension %s" \
                 % dim_name
