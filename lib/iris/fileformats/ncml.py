@@ -1,16 +1,18 @@
 """
-WARNING: THIS CODE IS A WORK IN PROGRESS. IT DOESN'T WORK FULLY YET AND IS LIABLE TO CHANGE.
+WARNING: THIS CODE IS EXPERIMENTAL. IT DOESN'T WORK FULLY YET AND IS LIABLE TO CHANGE.
 
 Iris i/o module for loading NcML v2.2 files. Current functionality is limited to the following:
 
-* only handles aggregations of netcdf files
+* aggregations of netcdf files only
 * union-type aggregation
-* joinExisting-type aggregation for simple 1D aggregation dimensions only
+* joinExisting-type aggregation (only for simple 1D aggregation dimensions)
+* joinNew-type aggregation (only for simple 1D aggregation dimensions)
 * rename or remove data variables (= cubes)
 * add, override, rename or remove attributes (global or per-variable)
-* create new 1D coordinate variables as DimCoord objects
+* reification of 1D coordinate variables as new DimCoord objects
+* handle timeUnitsChange attribute for joinExisting aggregations
 
-Functionality that is expressly excluded:
+Functionality that is excluded (and is unlikely to be implemented):
 
 * modification/removal of dimensions (this would interfere with Iris' handling of dimensions)
 * NcML group elements
@@ -21,10 +23,7 @@ Functionality that is expressly excluded:
 
 TO DO:
 
-* joinNew aggregation
-* handle dateFormatMark for join-type aggregations
-* handle coordValue attribute for join-type aggregations
-* handle timeUnitsChange attribute for join-type aggregations
+* handle dateFormatMark attribute for join-type aggregations
 * support loading of non-netcdf data formats?
 * add sphinx markup throughout
 """
@@ -42,7 +41,7 @@ DEFAULT_LOG_FORMAT = "[%(name)s] %(levelname)s: %(message)s"
 
 # Define lists of permissible attributes for various NcML 2.2 tags
 att_namelists = {
-    'aggregation': ('type', 'dimName', 'recheckEvery'),
+    'aggregation': ('type', 'dimName', 'recheckEvery', 'timeUnitsChange'),
     'attribute': ('name', 'type', 'separator', 'value', 'orgName'),
     'dimension': ('name', 'length', 'isUnlimited', 'isVariableLength', 'isShared', 'orgName'),
     'netcdf': ('location', 'id', 'title', 'enhance', 'addRecords', 'ncoords', 'coordValue'),
@@ -54,6 +53,10 @@ att_namelists = {
 
 class NcmlSyntaxError(iris.exceptions.IrisError) :
     """Exception class for NcML syntax errors."""
+    pass
+
+class NcmlContentError(iris.exceptions.IrisError) :
+    """Exception class for NcML content errors."""
     pass
 
 class NcmlElement(object) :
@@ -273,9 +276,9 @@ class NcmlDataset(object) :
         else :
             # if necessary, rename the variable from orgName to var.name
             if var.orgName :
-                cube = self._get_cube_by_var_name(var.orgName)
-                if cube :
-                    cube.var_name = var.name
+                cubes = self._get_cubes_by_var_name(var.orgName)
+                if cubes :
+                    for cube in cubes : cube.var_name = var.name
                     self.logger.info("Renamed variable %s to %s" % (var.orgName, var.name))
     
             # update any variable-scope attributes
@@ -416,6 +419,13 @@ class NcmlDataset(object) :
             self.logger.info("Created aggregation coordinate %s from coordValue elements" %
                 agg_dim_coord.var_name)
         
+        # If the timeUnitsChange attribute was specified, then rebase to a common time datum all
+        # the coordinate objects that match the nominated aggregation dimension. We have to assume
+        # that this attribute is only included if the agg. dimension is indeed a temporal one. 
+        if agg_elem.timeUnitsChange == "true" :
+            time_coords = _get_coord_list(self.cubelist, dim_name=agg_elem.dimName)
+            if time_coords : _rebase_time_coords(time_coords)
+        
         # Get distinct variable names from the raw loaded cubelist.
         distinct_var_names = sorted(set([c.name() for c in self.cubelist]))
         self.logger.debug("Distinct cube names: %s"%distinct_var_names)
@@ -428,8 +438,8 @@ class NcmlDataset(object) :
         # are (i) associated with 2 or more cubes, and (ii) reference the aggregation dimension.
         # All other variables are simply copied over as-is.
         for var_name in distinct_var_names :
-            var_cubes = self.cubelist.extract(var_name)
             self.logger.info("Attempting to merge cubes with name %s..." % var_name)
+            var_cubes = self.cubelist.extract(var_name)
             if len(var_cubes) > 1 :
                 if _has_same_outer_dim(var_cubes, agg_elem.dimName) :
                     try :
@@ -439,7 +449,7 @@ class NcmlDataset(object) :
                         for cube in var_cubes : del cube
                         self.logger.info("...merged %d cubes" % len(var_cubes))
                     except Exception, exc :
-                        self.logger.error("Unable to join cubes associated with variable "+var_name)
+                        self.logger.error("Unable to merge cubes associated with variable "+var_name)
                         self.logger.error(str(exc))
                         raise exc
                 else :
@@ -450,7 +460,7 @@ class NcmlDataset(object) :
                 joined_cubes.extend(var_cubes)
                 self.logger.info("...only 1 cube found so merge not possible")
 
-        # Advertise the results.
+        # Advertise the results of the merge.
         after = len(joined_cubes)
         if before != after :
             self.cubelist = joined_cubes
@@ -462,8 +472,123 @@ class NcmlDataset(object) :
             self.logger.info(msg)
 
     def _handle_joinnew(self, agg_elem) :
-        """Process a joinNew aggregation node"""
-        raise iris.exceptions.NotYetImplementedError()
+        """
+        Process a joinNew aggregation node. From the NcML spec:
+
+            A JoinNew dataset is constructed by transferring objects (dimensions, attributes,
+            groups, and variables) from the nested datasets in the order the nested datasets are
+            listed. All variables that are listed as aggregation variables are logically concaten-
+            ated along the new dimension, and in the order of the nested datasets. A coordinate
+            variable is created for the new dimension. Non-aggregation variables are treated as in
+            a Union dataset, i.e. skipped if one of that name already exists.
+
+        Processing logic:
+        
+        case 1: a <variable> element is used to define coordinates for the aggregation dimension
+            - create a new aggregation DimCoord object from the <values> sub-element within <variable>
+            - build a cubelist from the netcdf files specified in <netcdf> and/or <scan> elements
+            - foreach variable defined in a <variableAgg> element:
+                - subset (i.e. extract) the cubes corresponding to the variable
+                - create a new cube by concatenating the selected cubes
+                - attach the new aggregation DimCoord and any other Coord objects to this new cube
+                - discard the original cubes
+            - copy over any other unjoinable cubes as-is (simple union behaviour)
+
+        case 2: coordValue attributes within <netcdf> elements are used to define coordinates for
+                the aggregation dimension; a <variable> element defines extra attributes such as
+                standard_name, long_name, units, and so on 
+            - build a cubelist from the netcdf files specified in <netcdf> and/or <scan> elements
+            - create a new aggregation DimCoord object from the individual coordValue attributes,
+              which are assumed to be occur in the correct order in the ncml file
+            - foreach variable defined in a <variableAgg> element:
+                - subset (i.e. extract) the cubes corresponding to the variable
+                - create a new cube by concatenating the selected cubes
+                - attach the new aggregation DimCoord and any other Coord objects to this new cube
+                - discard the original cubes
+            - copy over any other unjoinable cubes as-is (simple union behaviour)
+        """
+        self.logger.info("Processing joinNew aggregation element...")
+        if not agg_elem.dimName :
+            errmsg = "<aggregation> elements of type 'joinNew' must include a 'dimName' attribute."
+            raise NcmlSyntaxError(errmsg)
+
+        # Get the list of aggregation variables.
+        agg_var_nodes = agg_elem.node.getElementsByTagName('variableAgg')
+        if not len(agg_var_nodes) :
+            errmsg = "<aggregation> elements of type 'joinNew' must contain one or more " + \
+                "<variableAgg> elements."
+            raise NcmlSyntaxError(errmsg)
+        agg_var_names = []
+        for node in agg_var_nodes :
+            agg_var_names.append(node.getAttribute('name'))
+
+        # Process any <netcdf> nodes.
+        nc_nodes = agg_elem.node.getElementsByTagName('netcdf')
+        if len(nc_nodes) :
+            for node in nc_nodes :
+                self._handle_agg_netcdf_node(node, agg_elem)
+
+        # Process any <scan> nodes.
+        scan_nodes = agg_elem.node.getElementsByTagName('scan')
+        if len(scan_nodes) :
+            for node in scan_nodes :
+                self._handle_agg_scan_node(node, agg_elem)
+
+        # If coordValue attributes were used, create a new DimCoord by concatenating the
+        # set of AuxCoord objects created in the _handle_agg_netcdf_node() method. If a zero-length
+        # DimCoord with the same name exists in the self.dim_coords cache, replace it with the
+        # new one created here.
+        if agg_elem.uses_coord_value_att :
+            agg_dim_coord = _create_agg_dim_coord(self.aux_coords)
+            old_dim_coord = self._find_agg_dim_coord(agg_elem.dimName)
+            if old_dim_coord and len(old_dim_coord.points) == 0:
+                self.dim_coords.remove(old_dim_coord)
+            self.dim_coords.append(agg_dim_coord)
+            self.logger.info("Created aggregation coordinate %s from coordValue elements" %
+                agg_dim_coord.var_name)
+
+        # To proceed, a new aggregation dimension must have been created earlier, either from
+        # <values> in a <variable> element, or from coordValue attributes on <netcdf> elements.  
+        agg_dim_coord = self._find_agg_dim_coord(agg_elem.dimName)
+        if not agg_dim_coord :
+            errmsg = "Unable to find or build aggregation dimension with name " + agg_elem.dimName
+            raise NcmlContentError(errmsg)
+
+        # Create an empty cubelist to hold the joined cubes.
+        joined_cubes = iris.cube.CubeList()
+        before = len(self.cubelist)
+        
+        # For each named aggregation variable, create a new cube by concatenating the existing cubes
+        # with that name along the new aggregation dimension. It is assumed that the cubelist for
+        # each aggregation variable is returned in the order of loading, and thus matches the length
+        # and order of the aggregation dimension.
+        for var_name in agg_var_names :
+            self.logger.info("Attempting to aggregate cubes with name %s..." % var_name)
+            var_cubes = self._get_cubes_by_var_name(var_name)
+            if len(var_cubes) > 1 :
+                try :
+                    tmp_cube = _aggregate_cubes(var_cubes, agg_dim_coord)
+                    joined_cubes.append(tmp_cube)
+                    for cube in var_cubes : del cube
+                    self.logger.info("...joined %d cubes" % len(var_cubes))
+                except Exception, exc :
+                    self.logger.error("Unable to join cubes associated with variable "+var_name)
+                    self.logger.error(str(exc))
+                    raise exc
+            else :
+                joined_cubes.extend(var_cubes)
+                self.logger.info("...only 1 cube found so join not possible")
+
+        # Advertise the results of the merge.
+        after = len(joined_cubes)
+        if before != after :
+            self.cubelist = joined_cubes
+            msg = "Aggregated %d input cubes into %d after join along %s dimension" \
+                % (before, after, agg_elem.dimName)
+            self.logger.info(msg)
+        else :
+            msg = "Unable to join any cubes along new %s dimension" % agg_elem.dimName
+            self.logger.info(msg)
 
     def _handle_agg_netcdf_node(self, netcdf_node, agg_elem) :
         """Process an aggregation netcdf node"""
@@ -548,11 +673,11 @@ class NcmlDataset(object) :
             return
         parent_tagname = remove_node.parentNode.tagName
         
-        # for variables remove the corresponding cube, if present
+        # for variables remove the corresponding cube(s), if present
         if obj_type == 'variable' :
-            cube = self._get_cube_by_var_name(obj_name)
-            if cube:
-                self.cubelist.remove(cube)
+            cubes = self._get_cubes_by_var_name(obj_name)
+            if cubes :
+                for cube in cubes : self.cubelist.remove(cube)
                 self.logger.info("Removed variable named %s" % obj_name)
             else :
                 self.logger.warn("No cube found corresponding to variable named %s" % obj_name)
@@ -565,9 +690,9 @@ class NcmlDataset(object) :
                 self.logger.info("Removed attribute %s from all variables" % obj_name)
             elif parent_tagname == 'variable' :
                 var_name = remove_node.parentNode.getAttribute('name')
-                cube = self._get_cube_by_var_name(var_name)
-                if cube:
-                    cube.attributes.pop(obj_name, None)
+                cubes = self._get_cubes_by_var_name(var_name)
+                if cubes :
+                    for cube in cubes : cube.attributes.pop(obj_name, None)
                     self.logger.info("Removed attribute %s from variable %s" % (obj_name, var_name))
                 else :
                     self.logger.warn("No cube found corresponding to variable named %s" % var_name)
@@ -612,9 +737,9 @@ class NcmlDataset(object) :
                     self.logger.info("Removed attribute %s from all cubes" % att_name)
                 elif item['parent_type'] == 'variable' :   # variable-scope attribute
                     var_name = item['parent_name']
-                    cube = self._get_cube_by_var_name(var_name)
-                    if cube:
-                        cube.attributes.pop(att_name, None)
+                    cubes = self._get_cubes_by_var_name(var_name)
+                    if cubes :
+                        for cube in cubes : cube.attributes.pop(att_name, None)
                         self.logger.info("Removed attribute %s from cube %s" % (att_name, var_name))
                     else :
                         self.logger.warn("No cube found corresponding to variable %s" % var_name)
@@ -810,7 +935,11 @@ class NcmlDataset(object) :
         return cube
 
     def _extend_cubelist(self, cubelist, unique_names=False) :
-        """Append distinct cubes from cubelist to the NcMLDataset's current cubelist."""
+        """
+        Append cubes from cubelist to the NcMLDataset's current cubelist. If the unique_names
+        argument is set to true then only append cubes with distinct names, which is the behaviour
+        required by union-type aggregations.
+        """
         for cube in cubelist :
             # skip variable if it's flagged for removal
             if self._is_flagged_for_removal(cube) :
@@ -820,7 +949,7 @@ class NcmlDataset(object) :
                 self.logger.info("Skipped netCDF variable %s (reason: loaded from earlier file)" % cube.var_name)
             else :
                 self.cubelist.append(cube)
-                self.logger.info("Added netCDF variable %s" % cube.var_name)
+                self.logger.info("Added cube for netCDF variable %s" % cube.var_name)
 
     def _find_agg_dim_coord(self, dim_name) :
         """Find the aggregation dimension Coord object associated with name dim_name."""
@@ -834,11 +963,9 @@ class NcmlDataset(object) :
             if not hasattr(cube, 'attributes') : cube.attributes = dict()
             cube.attributes.update(attrs)
 
-    def _get_cube_by_var_name(self, var_name) :
+    def _get_cubes_by_var_name(self, var_name) :
         """Return the loaded cube with the specified variable name."""
-        for cube in self.cubelist :
-            if cube.var_name == var_name : return cube
-        return None
+        return [cube for cube in self.cubelist if cube.var_name == var_name]
 
 def load_cubes(filenames, callback=None, **kwargs) :
     """
@@ -931,15 +1058,16 @@ def _get_node_text(node) :
     else :
         return text
 
-def _get_coord_list(cubelist) :
+def _get_coord_list(cubelist, dim_name=None) :
     """
     Return a list of coordinate objects (DimCoords, AuxCoords) associated with the specified
-    cubelist.
+    cubelist. The dim_name argument may be used to select only those coordinates with the
+    specified name.
     """
     # FIXME: this function would probably be better recast as a generator
     coord_list = []
     for cube in cubelist :
-        for coord in cube.coords() :
+        for coord in cube.coords(name=dim_name) :
             if coord not in coord_list : coord_list.append(coord)
     return coord_list
 
@@ -948,6 +1076,61 @@ def _has_same_outer_dim(cubelist, dim_name) :
     for cube in cubelist :
         if not cube.coords(name=dim_name, dim_coords=True, dimensions=0) : return False
     return True
+
+def _aggregate_cubes(cubelist, agg_dim_coord) :
+    """
+    Aggregate the specified cubelist along the aggregation dimension defined by agg_dim_coord,
+    which will form the outer dimension of the newly created and returned cube.
+    
+    TODO: much overlap with _concat_cubes method below - consider combining into one method
+    """
+    # Check that the number of input cubes equals the length of the aggregation dimension.
+    agg_dim_len = len(agg_dim_coord.points)
+    if agg_dim_len != len(cubelist) :
+        errmsg = "Length of aggregation dimension (%d) does not match number of cubes (%d)" \
+            % (agg_dim_len, len(cubelist))
+        raise iris.exceptions.DataLoadError(errmsg)
+    logger.debug("Shape of aggregation dimension: %s" % str(agg_dim_coord.shape))
+
+    # Check that all input cubes have the same shape.
+    cube0 = cubelist[0]
+    shape = cube0.shape
+    for cube in cubelist[1:] :
+        if cube.shape != shape :
+            errmsg = "Cubes for variable %s have inconsistent dimensions" % cube.var_name
+            raise iris.exceptions.DataLoadError(errmsg)
+
+    # Concatenate all the data arrays from the input cubes.
+    data = cube0.data
+    for cube in cubelist[1:] :
+        data = np.append(data, cube.data, axis=0)
+    data.shape = (agg_dim_len,) + shape
+    logger.debug("Shape of aggregated data array: %s" % str(data.shape))
+
+    # Create a new cube from the aggregated data array and by copying metadata attributes from
+    # the first input cube.
+    newcube = iris.cube.Cube(data, standard_name=cube0.standard_name, long_name=cube0.long_name,
+        units=cube0.units, attributes=cube0.attributes.copy(), cell_methods=cube0.cell_methods)
+
+    # Add aggregation coordinate as new outer dimension.
+    newcube.add_dim_coord(agg_dim_coord, 0)
+    logger.debug("Added dim coord %s at dimension 0" % agg_dim_coord.name())
+
+    # Copy over all original dimension coordinates, incrementing dimension numbers.
+    for coord in cube0.dim_coords :
+        dim = cube0.coord_dims(coord)[0] + 1
+        newcube.add_dim_coord(coord, dim)
+        logger.debug("Added dim coord %s at dimension %d" % (coord.name(), dim))
+
+    # Copy over all auxiliary coordinates, incrementing dimension numbers and skipping any temporary
+    # dimensions named '#...#'
+    for coord in cube0.aux_coords :
+        if getattr(coord, 'var_name', ' ')[0] == '#' : continue
+        dims = cube0.coord_dims(coord)
+        newcube.add_aux_coord(coord, map(lambda x:x+1, dims))
+        logger.debug("Added aux coord %s" % coord.name())
+
+    return newcube
 
 def _concat_cubes(cubelist, dim_name, agg_dim_coord=None) :
     """
@@ -977,13 +1160,13 @@ def _concat_cubes(cubelist, dim_name, agg_dim_coord=None) :
     # Create a new DimCoord object from dim_coord_list, which was sorted earlier.
     if not agg_dim_coord :
         agg_dim_coord = _concat_coords(dim_coord_list, sort=False)
-    logger.debug("Shape of aggregated coordinate data: %s" % str(agg_dim_coord.points.shape))
+    logger.debug("Shape of aggregated coordinate data: %s" % str(agg_dim_coord.shape))
 
     # Concatenate all the data arrays from the input cubes.
     # Is this the most efficient idiom? Preferable to np.concatenate I think.
     data = cubelist[0].data
-    for c in cubelist[1:] :
-        data = np.append(data, c.data, axis=0)
+    for cube in cubelist[1:] :
+        data = np.append(data, cube.data, axis=0)
     logger.debug("Shape of aggregated data array: %s" % str(data.shape))
 
     # Create a new cube from the aggregated data array and by copying metadata attributes from
@@ -1093,6 +1276,57 @@ def _extend_agg_dim_coord(dim_coord, coord_values) :
         logger.error(errmsg)
         logger.error(str(exc))
         raise exc
+
+def _rebase_time_coords(coord_list, target_unit=None) :
+    """
+    Rebase a list of CF-style time coordinate objects so that they all reference the same time
+    datum. The new time datum may be specified via the target_unit argument, which should be a
+    string of the form 'time-units since time-datum' or a Unit object which provides the same info.
+    In the latter case, the calendar property must match the same property in each coord object.
+    If the target_unit argument is not specified then it is set equal to the earliest datum in the
+    list of input coordinate objects. All of the input coordinate objects must use the same base
+    time units, e.g. seconds, days, hours. If a coordinate object contains bounds then those values
+    are also rebased.
+    """
+    coord0 = coord_list[0]
+    base_unit, base_datum = coord0.units.origin.split('since')
+    base_cal = coord0.units.calendar
+    if target_unit :
+        if isinstance(target_unit, basestring) :
+            target_unit = iris.unit.Unit(target_unit, calendar=base_cal)
+        elif isinstance(target_unit, iris.unit.Unit) :
+            if base_cal != target_unit.calendar :
+                errmsg = "source calendar (%s) and target calendar (%s) do not match" % \
+                    (base_cal, target_unit.calendar)
+                raise iris.exceptions.DataLoadError(errmsg)
+        else :
+            errmsg = "target_unit argument must be of type string or iris.unit.Unit"
+            raise iris.exceptions.DataLoadError(errmsg)
+    else :
+        # Find the earliest time datum in the input coordinate list
+        min_datum = _get_earliest_time_datum(coord_list)
+        target_unit = iris.unit.Unit(base_unit+'since'+min_datum, calendar=base_cal)
+    
+    # Convert all time coordinates (and bounds, if present) to the new target unit.
+    for crd in coord_list :
+        if not crd.units.convertible(target_unit) :
+            logger.warn("Cannot convert unit '%s' to '%s'" % (crd.units, target_unit))
+        else :
+            crd.points = crd.units.convert(crd.points, target_unit)
+            if crd.has_bounds() : crd.bounds = crd.units.convert(crd.bounds, target_unit)
+            crd.units = target_unit
+
+    logger.debug("Rebased time coordinates to '%s'" % target_unit)
+
+def _get_earliest_time_datum(coord_list) :
+    """Return the earliest time datum used by a collection of time coordinate objects."""
+    min_date = min_datum = None
+    for crd in coord_list :
+        crd_date = iris.unit.num2date(0, crd.units.origin, crd.units.calendar)
+        if min_date is None or crd_date < min_date :
+            min_date = crd_date
+            min_datum = crd.units.origin.split('since')[1]
+    return min_datum
 
 def _coord_sorter(coord, other) :
     """Sort two coord objects by comparing the value of their first point."""
