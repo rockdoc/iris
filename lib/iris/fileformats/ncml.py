@@ -36,7 +36,7 @@ import netCDF4 as nc4
 from xml.dom.minidom import parse
 
 # default logging options
-DEFAULT_LOG_LEVEL  = logging.WARN
+DEFAULT_LOG_LEVEL  = logging.INFO
 DEFAULT_LOG_FORMAT = "[%(name)s] %(levelname)s: %(message)s"
 
 # Define lists of permissible attributes for various NcML 2.2 tags
@@ -45,6 +45,7 @@ att_namelists = {
     'attribute': ('name', 'type', 'separator', 'value', 'orgName'),
     'dimension': ('name', 'length', 'isUnlimited', 'isVariableLength', 'isShared', 'orgName'),
     'netcdf': ('location', 'id', 'title', 'enhance', 'addRecords', 'ncoords', 'coordValue'),
+    'remove': ('name', 'type'),
     'scan': ('location', 'suffix', 'regExp', 'subdirs', 'olderThan', 'dateFormatMark', 'enhance'),
     'values': ('start', 'increment', 'npts', 'separator'),
     'variable': ('name', 'type', 'shape', 'orgName'),
@@ -64,12 +65,13 @@ class NcmlElement(object) :
     A lightweight class for creating an object representation of an NcML element with equivalent
     attributes. Avoids the need to create discrete classes for each NcML element type, which would
     be a viable alternative approach."""
-    def __init__(self, node) :
+    def __init__(self, node, **kwargs) :
         self.node = node
         for att_name in att_namelists.get(node.tagName,[]) :
             att_value = node.getAttribute(att_name)
             if att_value == '' : att_value = None
             setattr(self, att_name, att_value)
+        if kwargs : self.__dict__.update(kwargs)
 
     @property
     def elem_type(self) :
@@ -214,10 +216,6 @@ class NcmlDataset(object) :
         for att_node in att_nodelist :
             self._handle_attribute(att_node)
     
-    # TODO: certain attributes are treated as special by iris and cannot be assigned to a cube's
-    # attributes dictionary. The list of such attributes is defined in the LimitedAttributeDict
-    # class in module iris._cube_coord_common.py. We'll need to skip these.
-    
     def _handle_attribute(self, att_node, var_name=None) :
         """Process a single attribute node"""
         att = NcmlElement(att_node)
@@ -238,6 +236,9 @@ class NcmlDataset(object) :
 
         # rename and/or update the attribute in one or all cubes
         for cube in cubelist :
+            if att.name in cube.attributes._forbidden_keys :
+                self.logger.warn("Unable to set cube attribute with reserved name '%s'" % att.name)
+                return
             if att.orgName :
                 old_val = cube.attributes.pop(att.orgName, None)
             att_val = _parse_text_string(att.value, att.type, sep=att.separator)
@@ -256,7 +257,7 @@ class NcmlDataset(object) :
         """Process a data variable node"""
         var = NcmlElement(var_node)
         if self._is_coord_variable(var) : return
-        self.logger.info("Variable element: name: '%s', type: '%s'" % (var.name, var.type))
+        self.logger.debug("Variable element: name: '%s', type: '%s'" % (var.name, var.type))
 
         # Check to see if the variable contains a nested <values> element (i.e. data).
         val_nodes = var_node.getElementsByTagName('values')
@@ -332,6 +333,8 @@ class NcmlDataset(object) :
         if len(scan_nodes) :
             for node in scan_nodes :
                 self._handle_agg_scan_node(node, agg_elem)
+
+        self.logger.info("Loaded %d cubes" % len(self.cubelist))
 
     def _handle_joinexisting(self, agg_elem) :
         """
@@ -707,36 +710,33 @@ class NcmlDataset(object) :
             return
 
         for node in remove_nodelist :
-            obj_name = node.getAttribute('name')
-            obj_type = node.getAttribute('type')
-            if not (obj_name and obj_type) :
+            remove = NcmlElement(node)
+            if not (remove.name and remove.type) :
                 self.logger.warn("<remove> elements must include a 'name' and 'type' attribute.")
                 continue
-            if obj_type not in ('attribute', 'variable') :
+            if remove.type not in ('attribute', 'variable') :
                 self.logger.warn("Can only remove elements of type attribute or variable")
                 continue
-            parent_type = node.parentNode.tagName
-            if parent_type == 'netcdf' :
-                parent_name = 'netcdf'
+            remove.parent_type = node.parentNode.tagName
+            if remove.parent_type == 'netcdf' :
+                remove.parent_name = 'netcdf'
             else :
-                parent_name = node.parentNode.getAttribute('name')
-            # TODO: consider storing <remove> elements using NcmlElement class
-            d = dict(name=obj_name, type=obj_type, parent_name=parent_name, parent_type=parent_type)
-            self.removelist.append(d)
+                remove.parent_name = node.parentNode.getAttribute('name')
+            self.removelist.append(remove)
 
     def _process_remove_list(self) :
         """Process items in the remove list."""
         for item in self.removelist :
-            if item['type'] == 'variable' :   # variables should not have made it into the cubelist
+            if item.type == 'variable' :   # variables should not have made it into the cubelist
                 continue
-            elif item['type'] == 'attribute' :
-                att_name = item['name']
-                if item['parent_type'] == 'netcdf' :   # global attribute
+            elif item.type == 'attribute' :
+                att_name = item.name
+                if item.parent_type == 'netcdf' :   # global attribute
                     for cube in self.cubelist :
                         cube.attributes.pop(att_name, None)
                     self.logger.info("Removed attribute %s from all cubes" % att_name)
-                elif item['parent_type'] == 'variable' :   # variable-scope attribute
-                    var_name = item['parent_name']
+                elif item.parent_type == 'variable' :   # variable-scope attribute
+                    var_name = item.parent_name
                     cubes = self._get_cubes_by_var_name(var_name)
                     if cubes :
                         for cube in cubes : cube.attributes.pop(att_name, None)
@@ -860,9 +860,9 @@ class NcmlDataset(object) :
         if len(dim_coord.points) > 1 : dim_coord.guess_bounds()
         
         # Assign any extra (non-CF) attributes specified in the <variable> element.
-        for name,val in extra_atts.items() :
+        for name,value in extra_atts.items() :
             try :
-                dim_coord.attributes[name] = val
+                dim_coord.attributes[name] = value
             except :
                 self.logger.warn("Attribute named %s is not permitted on a DimCoord object" % name)
 
@@ -878,7 +878,7 @@ class NcmlDataset(object) :
         val_node = nodes[0]
         values = NcmlElement(val_node)
 
-        # compute or retrieve coordinate values
+        # Compute or retrieve coordinate values.
         if values.start :
             try :
                 start = int(values.start)
@@ -893,14 +893,18 @@ class NcmlDataset(object) :
             text_values = _get_node_text(val_node)
             points = _parse_text_string(text_values, var_elem.type, sep=values.separator)
 
-        # set any keyword arguments from nested <attribute> elements
+        # Set any keyword arguments from nested <attribute> elements.
         kw = dict(standard_name=None, long_name=None, units='1', cell_methods=None)
+        extra_atts = dict()
         att_nodelist = var_elem.node.getElementsByTagName('attribute')
         for node in att_nodelist :
-            name = node.getAttribute('name')
-            if name in kw : kw[name] = node.getAttribute('value')
+            name, value = _parse_attribute(node)
+            if name in kw :
+                kw[name] = value
+            else :
+                extra_atts[name] = value
 
-        # for a dimensioned (non-scalar) variable
+        # For a dimensioned (non-scalar) variable
         if var_elem.shape :
             shape = []
             coords = []
@@ -909,6 +913,7 @@ class NcmlDataset(object) :
             all_coords = self.dim_coords[:]
             all_coords.extend(_get_coord_list(self.cubelist))
             dimnum = 0
+            # for each dimension named in the shape attribute, find the corresponding coord object
             for i,dim_name in enumerate(var_elem.shape.split()) :
                 for dim_coord in all_coords :
                     if dim_name == dim_coord.var_name or dim_name == dim_coord.standard_name :
@@ -917,21 +922,30 @@ class NcmlDataset(object) :
                         dimnum += 1
                         break
 
-        # for a scalar variable we just need to set the array shape
+        # For a scalar variable we just need to set the array shape.
         else :
             shape = [1]
             coords = []
             
-        # create a cube object and add to self's cubelist
+        # Create a cube object and append to the dataset's cubelist.
         data = np.array(points)
         data.shape = shape
         cube = iris.cube.Cube(data, dim_coords_and_dims=coords, **kw)
         cube.var_name = var_elem.name
         cube.nctype = var_elem.type
+
+        # Assign any extra (non-CF) attributes specified in the <variable> element.
+        for name,value in extra_atts.items() :
+            try :
+                cube.attributes[name] = value
+            except :
+                self.logger.warn("Attribute named %s is not permitted on a cube" % name)
+
         self.cubelist.append(cube)
         self.logger.debug("- cube shape: %s" % str(data.shape))
         self.logger.debug("- cube min value: %s" % cube.data.min())
         self.logger.debug("- cube max value: %s" % cube.data.max())
+
         return cube
 
     def _extend_cubelist(self, cubelist, unique_names=False) :
@@ -1130,6 +1144,10 @@ def _aggregate_cubes(cubelist, agg_dim_coord) :
         newcube.add_aux_coord(coord, map(lambda x:x+1, dims))
         logger.debug("Added aux coord %s" % coord.name())
 
+    # Record a summary of the join operation in the history attribute.
+    newcube.attributes['history'] = _history_timestamp() + ": iris: variable created by " + \
+        "NcML-type aggregation along %s dimension" % agg_dim_coord.var_name
+
     return newcube
 
 def _concat_cubes(cubelist, dim_name, agg_dim_coord=None) :
@@ -1191,6 +1209,10 @@ def _concat_cubes(cubelist, dim_name, agg_dim_coord=None) :
         dims = cube0.coord_dims(coord)
         newcube.add_aux_coord(coord, dims)
         logger.debug("Added aux coord %s" % coord.name())
+
+    # Record a summary of the join operation in the history attribute.
+    newcube.attributes['history'] = _history_timestamp() + ": iris: variable created by " + \
+        "NcML-type aggregation along %s dimension" % dim_name
 
     return newcube
 
@@ -1346,6 +1368,12 @@ def _time_string_to_interval(timestr) :
         return long(interval)
     except :
         raise ValueError("Error trying to decode time period: %s" % timestr)
+
+def _history_timestamp() :
+    """Return a timestamp suitable for use at the beginning of a history attribute."""
+    from datetime import datetime
+    now = datetime.now()
+    return now.isoformat().split('.')[0]
 
 def _is_older_than(filename, interval) :
     """
