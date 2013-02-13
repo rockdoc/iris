@@ -36,7 +36,7 @@ import netCDF4 as nc4
 from xml.dom.minidom import parse
 
 # default logging options
-DEFAULT_LOG_LEVEL  = logging.INFO
+DEFAULT_LOG_LEVEL  = logging.WARNING
 DEFAULT_LOG_FORMAT = "[%(name)s] %(levelname)s: %(message)s"
 
 # Define lists of permissible attributes for various NcML 2.2 tags
@@ -1342,11 +1342,15 @@ def _rebase_time_coords(coord_list, target_unit=None) :
 
 def _get_earliest_time_datum(coord_list) :
     """Return the earliest time datum used by a collection of time coordinate objects."""
-    min_date = min_datum = None
-    for crd in coord_list :
+    ref_origin = coord_list[0].units.origin
+    ref_cal = coord_list[0].units.calendar
+    min_offset = 0
+    min_datum = ref_origin.split('since')[1]
+    for crd in coord_list[1:] :
         crd_date = iris.unit.num2date(0, crd.units.origin, crd.units.calendar)
-        if min_date is None or crd_date < min_date :
-            min_date = crd_date
+        crd_offset = iris.unit.date2num(crd_date, ref_origin, ref_cal)
+        if crd_offset < min_offset :
+            min_offset = crd_offset
             min_datum = crd.units.origin.split('since')[1]
     return min_datum
 
