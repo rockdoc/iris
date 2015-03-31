@@ -408,6 +408,9 @@ class NcmlDataset(object):
         # Load data from any <netcdf> and/or <scan> child nodes.
         cubes_to_copy = self._load_aggregation_data(agg_elem)
 
+        # If coordinate values were NOT supplied via coordValue attributes
+        # attached to <netcdf> element(s) then check to see if they were
+        # specified as part of a coordinate <variable> element.
         if not agg_elem.coord_values:
             agg_dim_crd = self._find_agg_dim_coord(agg_elem.dimName)
             if agg_dim_crd and len(agg_dim_crd.points) > 0:
@@ -465,6 +468,9 @@ class NcmlDataset(object):
         # Load data from any <netcdf> and/or <scan> child nodes.
         cubes_to_copy = self._load_aggregation_data(agg_elem)
 
+        # If coordinate values were NOT supplied via coordValue attributes
+        # attached to <netcdf> element(s) then check to see if they were
+        # specified as part of a coordinate <variable> element.
         if not agg_elem.coord_values:
             agg_dim_crd = self._find_agg_dim_coord(agg_elem.dimName)
             if agg_dim_crd and len(agg_dim_crd.points) > 0:
@@ -737,7 +743,7 @@ class NcmlDataset(object):
         # later on from coordValue attributes on <netcdf> elements nested in a
         # join-type aggregation.
         else:
-            points = []
+            points = np.array([], dtype=NCML_TO_NUMPY_TYPE_MAP[var_elem.type])
             self.logger.debug(
                 "No <values> defined for coordinate variable '%s'",
                 var_elem.name)
@@ -759,7 +765,7 @@ class NcmlDataset(object):
         if cal: kw['units'] = iris.unit.Unit(kw['units'], calendar=cal)
 
         # Create and store the DimCoord object for subsequent use.
-        dim_coord = DimCoord(np.array(points, dtype=var_elem.type), **kw)
+        dim_coord = DimCoord(points, **kw)
         dim_coord.var_name = var_elem.name
         dim_coord.nctype = var_elem.type
         #if len(dim_coord.points) > 1: dim_coord.guess_bounds()
@@ -783,7 +789,7 @@ class NcmlDataset(object):
                 "data variable")
 
         val_node = nodes[0]
-        points = _parse_values_node(val_node, var_elem.type)
+        data = _parse_values_node(val_node, var_elem.type)
 
         # Set any keyword arguments from nested <attribute> elements.
         kw = dict(standard_name=None, long_name=None, units='1',
@@ -822,7 +828,6 @@ class NcmlDataset(object):
             coords = []
 
         # Create a cube object and append to the dataset's cubelist.
-        data = np.array(points)
         data.shape = shape
         cube = iris.cube.Cube(data, dim_coords_and_dims=coords, **kw)
         cube.var_name = var_elem.name
@@ -885,10 +890,11 @@ class NcmlDataset(object):
             cube.attributes.update(attrs)
 
     def _get_cubes_by_var_name(self, var_name):
-        """Return the loaded cube with the specified variable name."""
+        """Return the cube or cubes having the specified variable name."""
         return [cube for cube in self.cubelist if cube.var_name == var_name]
 
 
+# TODO: the following two functions could be merged into one.
 def _extract_cubes_by_var_name(cubelist, var_name):
     """
     Extract from `cubelist` those cubes whose variable name matches dim_name.
@@ -1007,11 +1013,20 @@ def _update_agg_dim_coords(cubes_to_join, agg_elem):
             raise NcmlContentError("Insufficient coordinates defined to assign "
                 "to aggregation dimension %s", agg_elem.dimName)
         dimcrd.points = np.array(agg_elem.coord_values[start:stop])
+
+        # Remove coordinate bounds, if present, since they will likely not match
+        # the new coordinate values generated for the aggregated dataset.
+        if dimcrd.has_bounds():
+            dimcrd.bounds = None
+
+        # Update coordinate metadata if a template coordinate is provided.
         if agg_elem.template_coord:
             for attname in ('standard_name', 'long_name', 'units'):
                 attval = getattr(agg_elem.template_coord, attname, None)
                 if attval: setattr(dimcrd, attname, attval)
             dimcrd.attributes.update(agg_elem.template_coord.attributes)
+
+        # Move start index forward ready for next chunk of coordinates.
         start = stop
 
     if stop != agg_dim_len:
@@ -1113,7 +1128,7 @@ def _get_node_text(node):
 
 
 def _parse_values_node(val_node, nctype, npts=None):
-    """Construct a list of points from a <values> XML element."""
+    """Construct an array of points as read from a <values> NcML element."""
 
     values = NcmlElement(val_node)
 
@@ -1125,6 +1140,7 @@ def _parse_values_node(val_node, nctype, npts=None):
         if not len(points):
             raise NcmlContentError(
                 "No values defined within a <values> element")
+        points = np.array(points, dtype=NCML_TO_NUMPY_TYPE_MAP[nctype])
 
     # Compute coordinate values from the start, increment and, optionally,
     # npts attributes defined in the <values> element.
