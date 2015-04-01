@@ -15,14 +15,15 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with Iris.  If not, see <http://www.gnu.org/licenses/>.
 """
-Iris file format module for loading NcML v2.2 files.
+Iris file format module for loading NcML v2.2 files. The home page for NcML is:
+http://www.unidata.ucar.edu/software/thredds/current/netcdf-java/ncml
 
-The following components of the NcML 2 model are supported:
+The following components of the NcML 2 data model are supported:
 
 * aggregation of datasets encoded in any of the formats recognised by Iris
-* union-type aggregation
-* joinExisting-type aggregation (for simple 1D aggregation dimensions only)
-* joinNew-type aggregation (for simple 1D aggregation dimensions only)
+* union-type aggregations
+* joinExisting-type aggregations (for simple 1D aggregation dimensions only)
+* joinNew-type aggregations (for simple 1D aggregation dimensions only)
 * addition, removal and renaming of data variables
 * addition, removal and renaming of global or variable attributes
 * support for timeUnitsChange attribute on joinExisting aggregations

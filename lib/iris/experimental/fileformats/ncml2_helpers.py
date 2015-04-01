@@ -180,10 +180,10 @@ class NcmlDataset(object):
 
     ### Private methods only below this point ###
 
-    def _handle_doc(self, doc):
-        """Process the document element."""
-        self.logger.debug("Document element name: %s",
-            doc.documentElement.tagName)
+    def _handle_doc(self, doc_root):
+        """Process the root node of the NcML document."""
+        doc = doc_root.documentElement
+        self.logger.debug("Document element name: %s", doc.tagName)
 
         # Process the <readMetadata> or <explicit> nodes, if present.
         self.explicit = doc.getElementsByTagName('explicit')
@@ -205,7 +205,7 @@ class NcmlDataset(object):
         agg_nodelist = doc.getElementsByTagName('aggregation')
         if len(agg_nodelist): self._handle_aggregation(agg_nodelist[0])
 
-        # Process any global <attribute> nodes.
+        # Process any <attribute> nodes.
         att_nodelist = [n for n in doc.getElementsByTagName('attribute')
             if n.parentNode.tagName == 'netcdf']
         if len(att_nodelist): self._handle_global_attributes(att_nodelist)
@@ -215,6 +215,9 @@ class NcmlDataset(object):
 
         # Process any items in the removals list.
         self._process_remove_list()
+        
+        # Process any document element attributes (e.g. id, title).
+        self._handle_doc_attributes(doc)
 
     def _handle_dimensions(self, dim_nodelist):
         """Process all dimension nodes"""
@@ -232,6 +235,19 @@ class NcmlDataset(object):
         self.dim_nodes.append(dim)
         self.logger.debug("Added dimension named '%s' with length %d",
             dim.name, dim.length)
+
+    def _handle_doc_attributes(self, doc_node):
+        """Process any document element attributes, such as title."""
+        self.logger.debug("Processing document element attributes...")
+        doc_elem = NcmlElement(doc_node)
+
+        # If they are specified in the NcML file, assign id and title attributes
+        # to the final cubelist.
+        for attname in ['id', 'title']:
+            attval = getattr(doc_elem, attname, None)
+            if attval:
+                for cube in self.cubelist:
+                    cube.attributes[attname] = attval
 
     def _handle_global_attributes(self, att_nodelist):
         """Process all attribute nodes"""
@@ -545,6 +561,9 @@ class NcmlDataset(object):
         if not scan.location:
             raise NcmlSyntaxError(
                 "<scan> elements must include a 'location' attribute.")
+
+        # Display warnings for any unsupported XML attributes.
+        check_unsupported_attributes(scan, ['dateFormatMark'])
 
         topdir = scan.location
         self.logger.debug("Scanning for files below directory %s", topdir)
