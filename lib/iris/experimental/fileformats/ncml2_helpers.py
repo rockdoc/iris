@@ -1208,8 +1208,10 @@ def _parse_values_from_text(text, nctype='String', sep=None):
     NOTE: there is no support at present for the 'Structure' data type described
     in the NcML spec.
     """
-    if nctype in ('char', 'string', 'String'):
+    if nctype in ('string', 'String'):
         return text
+    elif nctype == 'char':
+        values = [np.string_(x) for x in text]
     elif nctype == 'byte':
         values = [np.int8(x) for x in text.split(sep)]
     elif nctype == 'short':
