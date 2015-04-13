@@ -187,6 +187,9 @@ class NcmlDataset(object):
 
         # Process the <readMetadata> or <explicit> nodes, if present.
         self.explicit = doc.getElementsByTagName('explicit')
+        
+        # Load data from filename defined in 'location' attribute, if set.
+        self._load_root_netcdf_data(doc.getAttribute('location'))
 
         # Create a list of items to remove during or after cube loading.
         remove_nodelist = doc.getElementsByTagName('remove')
@@ -610,6 +613,26 @@ class NcmlDataset(object):
 
         return loaded_cubes
 
+    def _load_root_netcdf_data(self, ncpath):
+        """
+        Load data from the file specified via the 'location' attribute on the
+        <netcdf> document element.
+        """
+        if not ncpath:
+            return
+        if not ncpath.startswith('/'):
+            ncpath = os.path.join(self.basedir, ncpath)
+
+        if not os.path.exists(ncpath):
+            self.logger.warn("File '%s' does not exist", ncpath)
+            return
+        else:
+            self.logger.debug("Loading file '%s'...", ncpath)
+
+        cubes = iris.load(ncpath)
+        if len(cubes):
+            self._extend_cubelist(cubes)
+
     def _make_remove_list(self, remove_nodelist):
         """
         Make a list of objects flagged for removal. At present only variables
@@ -904,7 +927,7 @@ class NcmlDataset(object):
         Override any cube attributes with those specified in the `attrs`
         argument.
         """
-        for cube in self.get_cubes():
+        for cube in self.cubelist:
             if not hasattr(cube, 'attributes'): cube.attributes = dict()
             cube.attributes.update(attrs)
 
