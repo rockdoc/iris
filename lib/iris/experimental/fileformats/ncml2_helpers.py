@@ -69,6 +69,12 @@ NCML_TO_NUMPY_TYPE_MAP = {
     'char': 'S1'
 }
 
+# Tuple of attribute names which Iris prohibits from using as keys in the
+# cube.attributes dictionary.
+from iris._cube_coord_common import LimitedAttributeDict
+SPECIAL_CUBE_ATT_NAMES = LimitedAttributeDict._forbidden_keys
+SPECIAL_CUBE_ATT_NAMES += ('var_name',)
+
 
 class NcmlSyntaxError(Exception):
     """Exception class for NcML syntax errors."""
@@ -289,14 +295,7 @@ class NcmlDataset(object):
         # rename and/or update the attribute in one or all cubes
         for cube in cubelist:
             try:
-                if att.orgName:
-                    old_val = cube.attributes.pop(att.orgName, None)
-                else:
-                    old_val = None
-                if att_val is not None:
-                    cube.attributes[att.name] = att_val
-                elif old_val is not None:
-                    cube.attributes[att.name] = old_val
+                _set_cube_attribute(cube, att.name, att.value, old_name=att.orgName)
             except:
                 self.logger.warn("Unable to set cube attribute with name '%s'",
                     att.name)
@@ -540,7 +539,7 @@ class NcmlDataset(object):
                 "<netcdf> elements must include a 'location' attribute.")
 
         # Display warnings for any unsupported XML attributes.
-        check_unsupported_attributes(netcdf, ['enhance', 'addRecords'])
+        _check_unsupported_attributes(netcdf, ['enhance', 'addRecords'])
 
         ncpath = netcdf.location
         if not ncpath.startswith('/'):
@@ -566,7 +565,7 @@ class NcmlDataset(object):
                 "<scan> elements must include a 'location' attribute.")
 
         # Display warnings for any unsupported XML attributes.
-        check_unsupported_attributes(scan, ['dateFormatMark'])
+        _check_unsupported_attributes(scan, ['dateFormatMark'])
 
         topdir = scan.location
         self.logger.debug("Scanning for files below directory %s", topdir)
@@ -1383,13 +1382,50 @@ def _walk_dir_tree(topdir, recurse=True, regex=None, min_age=None, sort=False):
         if not recurse: break
 
 
-def check_unsupported_attributes(element, att_list):
+def _check_unsupported_attributes(element, att_list):
     """Display a warning message for any unsupported XML attributes."""
     for att_name in att_list:
         if getattr(element, att_name) is None: continue
         msg = "The '{0}' attribute on a <{1}> element is not " \
             "currently supported".format(att_name, element.elem_type)
         logger.warn(msg)
+
+
+def _set_cube_attribute(cube, att_name, att_value, old_name=''):
+    """
+    Set a cube attribute, catering for the fact that Iris prohibits certain
+    attribute names as keys in the cube.attributes dictionary.
+    """
+    if old_name is None: old_name = ''
+    if old_name:
+        if hasattr(cube, old_name):
+            old_value = getattr(cube, old_name)
+        else:
+            old_value = cube.attributes.get(old_name)
+    else:
+        old_value = None
+
+    if att_value is None and old_value is not None:
+        att_value = old_value
+
+    # If att_name is *not* one of Iris's reserved attributes, assign it to the
+    # cube's attributes dictionary.
+    if att_name not in SPECIAL_CUBE_ATT_NAMES:
+        cube.attributes[att_name] = att_value
+        if old_name: cube.attributes.pop(old_name, 0)
+    
+    # Otherwise assign it directly against the cube object, checking to see
+    # if the attribute needs to be handled in a special way, as some do.
+    # TODO: this checklist is probably incomplete
+    else:
+        if att_name == 'cell_methods':
+            cube.cell_methods = ()
+            cube.add_cell_method(iris.coords.CellMethod(att_value))
+        elif att_name in ('_FillValue', 'missing_value'):
+            cube.data.set_fill_value(att_value)
+        else:
+            setattr(cube, att_name, att_value)
+        if hasattr(cube, old_name): del cube.old_name
 
 
 def _init_logger(level=DEFAULT_LOG_LEVEL, fmt=DEFAULT_LOG_FORMAT):
